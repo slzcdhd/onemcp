@@ -37,32 +37,56 @@ class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
     }
     
     func createNewWindow() {
-        // For SwiftUI apps, we need to trigger window creation through the Window menu
-        // Find the File menu and trigger New Window
-        if let fileMenu = NSApp.mainMenu?.items.first(where: { $0.title == "File" })?.submenu {
-            // Look for "New Window" item
-            if let newWindowItem = fileMenu.items.first(where: { 
-                $0.title.lowercased().contains("new") && 
-                $0.keyEquivalent == "n" &&
-                $0.keyEquivalentModifierMask.contains(.command)
-            }) {
-                NSApp.sendAction(newWindowItem.action!, to: newWindowItem.target, from: newWindowItem)
-                return
-            }
-        }
-        
-        // Fallback: Use the Window menu
+        // Method 1: Try to use the Window menu's New Window command
         if let windowMenu = NSApp.mainMenu?.items.first(where: { $0.title == "Window" })?.submenu {
-            if let newWindowItem = windowMenu.items.first(where: { 
-                $0.title.lowercased().contains("new") 
-            }) {
-                NSApp.sendAction(newWindowItem.action!, to: newWindowItem.target, from: newWindowItem)
+            for item in windowMenu.items {
+                if item.title.lowercased().contains("new") && item.action != nil {
+                    NSApp.sendAction(item.action!, to: item.target, from: item)
+                    return
+                }
+            }
+        }
+        
+        // Method 2: Try File menu's New Window command
+        if let fileMenu = NSApp.mainMenu?.items.first(where: { $0.title == "File" })?.submenu {
+            for item in fileMenu.items {
+                if item.title.lowercased().contains("new") && 
+                   item.title.lowercased().contains("window") &&
+                   item.action != nil {
+                    NSApp.sendAction(item.action!, to: item.target, from: item)
+                    return
+                }
+            }
+        }
+        
+        // Method 3: Try standard new window selectors
+        let selectors = [
+            #selector(NSApplication.newWindowForTab(_:))
+        ]
+        
+        for selector in selectors {
+            if NSApp.sendAction(selector, to: nil, from: nil) {
                 return
             }
         }
         
-        // Last resort: Send new window action to responder chain
-        NSApp.sendAction(#selector(NSApplication.newWindowForTab(_:)), to: nil, from: nil)
+        // Method 4: Force window creation by changing activation policy
+        let currentPolicy = NSApp.activationPolicy()
+        if currentPolicy == .accessory {
+            NSApp.setActivationPolicy(.regular)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                NSApp.activate(ignoringOtherApps: true)
+                // Try again after policy change
+                NSApp.sendAction(#selector(NSApplication.newWindowForTab(_:)), to: nil, from: nil)
+                
+                // Restore policy if needed
+                if !(self.appState?.config.ui.showInDock ?? true) {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                        NSApp.setActivationPolicy(.accessory)
+                    }
+                }
+            }
+        }
     }
     
     func applicationWillTerminate(_ notification: Notification) {
@@ -74,27 +98,63 @@ class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
         // Show main window when dock icon is clicked
         if !flag {
             // No visible windows, need to create a new one
-            // For SwiftUI apps, we trigger window creation by opening a new window
-            NSApp.sendAction(#selector(NSApplication.newWindowForTab(_:)), to: nil, from: nil)
+            showMainWindow()
         } else {
             // There are visible windows, just bring them to front
-            if let window = NSApplication.shared.windows.first(where: { window in
+            for window in NSApplication.shared.windows {
                 let className = window.className
-                return !className.contains("StatusBar") && 
-                       !className.contains("PopupMenu") &&
-                       !className.contains("NSMenu") &&
-                       className.contains("NSWindow")
-            }) {
-                window.makeKeyAndOrderFront(nil)
-                NSApp.activate(ignoringOtherApps: true)
+                if !className.contains("StatusBar") && 
+                   !className.contains("PopupMenu") &&
+                   !className.contains("NSMenu") &&
+                   window.isVisible {
+                    window.makeKeyAndOrderFront(nil)
+                    NSApp.activate(ignoringOtherApps: true)
+                }
             }
         }
         return true
     }
     
+    func showMainWindow() {
+        // First try to find an existing window
+        if let existingWindow = NSApplication.shared.windows.first(where: { window in
+            let className = window.className
+            return !className.contains("StatusBar") && 
+                   !className.contains("PopupMenu") &&
+                   !className.contains("NSMenu") &&
+                   className.contains("NSWindow")
+        }) {
+            // Make sure window is visible
+            existingWindow.setIsVisible(true)
+            existingWindow.deminiaturize(nil)
+            existingWindow.makeKeyAndOrderFront(nil)
+            existingWindow.orderFrontRegardless()
+            NSApp.activate(ignoringOtherApps: true)
+        } else {
+            // Create new window using various methods
+            
+            // First, try sending a notification to SwiftUI
+            NotificationCenter.default.post(name: .showMainWindow, object: nil)
+            
+            // Also try traditional window creation methods
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                // If notification didn't work, try other methods
+                if NSApplication.shared.windows.first(where: { window in
+                    let className = window.className
+                    return !className.contains("StatusBar") && 
+                           !className.contains("PopupMenu") &&
+                           !className.contains("NSMenu") &&
+                           window.isVisible
+                }) == nil {
+                    self.createNewWindow()
+                }
+            }
+        }
+    }
+    
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        // Don't quit when main window is closed if running in background
-        return !(appState?.config.ui.showInDock ?? true)
+        // Never quit when window is closed - we're a menu bar app
+        return false
     }
     
     @MainActor

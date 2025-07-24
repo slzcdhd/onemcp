@@ -5,6 +5,7 @@ import Logging
 struct OneMCPApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @StateObject private var appState = AppState()
+    @Environment(\.openWindow) private var openWindow
     
     init() {
         // Configure logging
@@ -16,7 +17,7 @@ struct OneMCPApp: App {
     }
     
     var body: some Scene {
-        WindowGroup("OneMCP") {
+        WindowGroup("OneMCP", id: "main") {
             ContentView()
                 .environmentObject(appState)
                 .onAppear {
@@ -26,6 +27,32 @@ struct OneMCPApp: App {
                     // Setup MenuBar and start service
                     appDelegate.setupMenuBarAndStartService()
                 }
+                .onReceive(NotificationCenter.default.publisher(for: NSApplication.willBecomeActiveNotification)) { _ in
+                    // Ensure window is visible when app becomes active
+                    if let window = NSApplication.shared.windows.first(where: { $0.isVisible }) {
+                        window.makeKeyAndOrderFront(nil)
+                    }
+                }
+                .onReceive(NotificationCenter.default.publisher(for: .showMainWindow)) { _ in
+                    // Handle request to show main window
+                    if #available(macOS 13.0, *) {
+                        openWindow(id: "main")
+                    } else {
+                        // For older macOS, ensure window is visible
+                        DispatchQueue.main.async {
+                            if let window = NSApplication.shared.windows.first(where: { window in
+                                let className = window.className
+                                return !className.contains("StatusBar") && 
+                                       !className.contains("PopupMenu") &&
+                                       !className.contains("NSMenu")
+                            }) {
+                                window.setIsVisible(true)
+                                window.makeKeyAndOrderFront(nil)
+                                NSApp.activate(ignoringOtherApps: true)
+                            }
+                        }
+                    }
+                }
         }
         .windowStyle(.titleBar)
         .windowToolbarStyle(.unified)
@@ -34,6 +61,18 @@ struct OneMCPApp: App {
                 Button("About OneMCP") {
                     showAboutPanel()
                 }
+            }
+            CommandGroup(replacing: .newItem) {
+                Button("New Window") {
+                    // This will create a new window in SwiftUI
+                    if #available(macOS 13.0, *) {
+                        openWindow(id: "main")
+                    } else {
+                        // For older macOS, use AppDelegate method
+                        appDelegate.createNewWindow()
+                    }
+                }
+                .keyboardShortcut("n", modifiers: .command)
             }
         }
         

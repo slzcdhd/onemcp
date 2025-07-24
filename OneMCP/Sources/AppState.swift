@@ -3,6 +3,11 @@ import Foundation
 import Combine
 import Logging
 
+// Notification for requesting window to be shown
+extension Notification.Name {
+    static let showMainWindow = Notification.Name("com.onemcp.showMainWindow")
+}
+
 @MainActor
 class AppState: ObservableObject {
     @Published var config: AppConfig = AppConfig()

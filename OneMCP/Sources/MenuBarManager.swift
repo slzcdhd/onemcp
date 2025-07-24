@@ -602,6 +602,16 @@ class MenuBarManager: ObservableObject {
 
     
     @objc private func showMainWindow() {
+        // Use AppDelegate's showMainWindow method which has more robust window creation logic
+        if let appDelegate = NSApp.delegate as? AppDelegate {
+            appDelegate.showMainWindow()
+        } else {
+            // Fallback to previous implementation if AppDelegate is not available
+            showMainWindowFallback()
+        }
+    }
+    
+    private func showMainWindowFallback() {
         // Get current activation policy and window info
         let currentPolicy = NSApp.activationPolicy()
         
@@ -683,23 +693,8 @@ class MenuBarManager: ObservableObject {
 
     
     @objc private func showPreferences() {
-        // Try multiple approaches to show the window
+        // Use the improved showMainWindow method
         showMainWindow()
-        
-        // Alternative approach: try to unhide the app
-        NSApplication.shared.unhide(nil)
-        
-        // Additional attempt: Use DispatchQueue to try again after a short delay
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-            if let window = NSApplication.shared.windows.first {
-                if !window.isVisible {
-                    window.setIsVisible(true)
-                    window.makeKeyAndOrderFront(nil)
-                    window.center()
-                    NSApplication.shared.activate(ignoringOtherApps: true)
-                }
-            }
-        }
     }
     
     @objc private func quitApp() {
