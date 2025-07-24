@@ -1,0 +1,11 @@
+.kiro
+.build
+.swiftpm
+.vscode
+.claude
+.cursor
+.DS_Store
+OneMCP.app
+OneMCP-*.dmg
+assets/generated
+assets/scripts/generate_icons.sh
