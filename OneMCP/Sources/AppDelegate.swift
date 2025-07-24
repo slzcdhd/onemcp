@@ -36,6 +36,35 @@ class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
         }
     }
     
+    func createNewWindow() {
+        // For SwiftUI apps, we need to trigger window creation through the Window menu
+        // Find the File menu and trigger New Window
+        if let fileMenu = NSApp.mainMenu?.items.first(where: { $0.title == "File" })?.submenu {
+            // Look for "New Window" item
+            if let newWindowItem = fileMenu.items.first(where: { 
+                $0.title.lowercased().contains("new") && 
+                $0.keyEquivalent == "n" &&
+                $0.keyEquivalentModifierMask.contains(.command)
+            }) {
+                NSApp.sendAction(newWindowItem.action!, to: newWindowItem.target, from: newWindowItem)
+                return
+            }
+        }
+        
+        // Fallback: Use the Window menu
+        if let windowMenu = NSApp.mainMenu?.items.first(where: { $0.title == "Window" })?.submenu {
+            if let newWindowItem = windowMenu.items.first(where: { 
+                $0.title.lowercased().contains("new") 
+            }) {
+                NSApp.sendAction(newWindowItem.action!, to: newWindowItem.target, from: newWindowItem)
+                return
+            }
+        }
+        
+        // Last resort: Send new window action to responder chain
+        NSApp.sendAction(#selector(NSApplication.newWindowForTab(_:)), to: nil, from: nil)
+    }
+    
     func applicationWillTerminate(_ notification: Notification) {
         // Cleanup resources
         menuBarManager = nil
@@ -44,8 +73,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         // Show main window when dock icon is clicked
         if !flag {
-            if let window = NSApplication.shared.windows.first {
+            // No visible windows, need to create a new one
+            // For SwiftUI apps, we trigger window creation by opening a new window
+            NSApp.sendAction(#selector(NSApplication.newWindowForTab(_:)), to: nil, from: nil)
+        } else {
+            // There are visible windows, just bring them to front
+            if let window = NSApplication.shared.windows.first(where: { window in
+                let className = window.className
+                return !className.contains("StatusBar") && 
+                       !className.contains("PopupMenu") &&
+                       !className.contains("NSMenu") &&
+                       className.contains("NSWindow")
+            }) {
                 window.makeKeyAndOrderFront(nil)
+                NSApp.activate(ignoringOtherApps: true)
             }
         }
         return true
@@ -61,15 +102,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
         guard let appState = appState else { return }
         
         // Configure dock visibility
-        let currentPolicy = NSApp.activationPolicy()
-        print("[AppDelegate] Current activation policy: \(currentPolicy.rawValue)")
-        
         if !appState.config.ui.showInDock {
             NSApp.setActivationPolicy(.accessory)
-            print("[AppDelegate] Set activation policy to .accessory (showInDock = false)")
         } else {
             NSApp.setActivationPolicy(.regular)
-            print("[AppDelegate] Set activation policy to .regular (showInDock = true)")
         }
         
         // Handle start minimized preference
@@ -113,14 +149,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
         Usage: OneMCP [options]
         
         Options:
-          --hidden, --minimized    Start the application in the background
-          --port <number>          Override the server port (default: 3000)
-          --host <address>         Override the server host (default: localhost)
-          --help                   Show this help message
+            --port <port>    Set the MCP server port (default: 3000)
+            --hidden         Start with window hidden
+            --help           Show this help message
         
         Examples:
-          OneMCP --port 8080 --hidden
-          OneMCP --host 0.0.0.0 --port 3001
+            OneMCP --port 3000 --hidden
         """)
     }
 }
@@ -145,7 +179,7 @@ extension AppDelegate {
                 try SMAppService.mainApp.unregister()
             }
         } catch {
-            print("Failed to \(enable ? "enable" : "disable") launch at login: \(error)")
+            // Silently fail - launch at login is not critical
         }
     }
     

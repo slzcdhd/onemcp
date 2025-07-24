@@ -54,8 +54,6 @@ public actor SubprocessStdioTransport: Transport {
     public func connect() async throws {
         guard !isConnected else { return }
         
-        logger.info("Starting subprocess: \(command) \(arguments.joined(separator: " "))")
-        
         let process = Process()
         
         // Resolve command path if it's not an absolute path
@@ -128,7 +126,6 @@ public actor SubprocessStdioTransport: Transport {
         }
         
         process.environment = processEnvironment
-        logger.info("Process environment PATH: \(processEnvironment["PATH"] ?? "not set")")
         
         // Set working directory if specified
         if let workingDirectory = workingDirectory {
@@ -162,7 +159,6 @@ public actor SubprocessStdioTransport: Transport {
             try setNonBlocking(fileDescriptor: self.stdoutDescriptor!)
             
             isConnected = true
-            logger.info("Subprocess started successfully with PID: \(process.processIdentifier)")
             
             // Start reading loop (following official SDK pattern)
             Task {
@@ -183,8 +179,6 @@ public actor SubprocessStdioTransport: Transport {
     public func disconnect() async {
         guard isConnected else { return }
         
-        logger.info("Disconnecting subprocess transport")
-        
         // Clean up file descriptors
         stdinDescriptor = nil
         stdoutDescriptor = nil
@@ -197,7 +191,6 @@ public actor SubprocessStdioTransport: Transport {
                 try? await Task.sleep(for: .milliseconds(500))
                 
                 if process.isRunning {
-                    logger.warning("Process did not terminate gracefully, force killing")
                     // Use SIGKILL instead of process.kill()
                     kill(process.processIdentifier, SIGKILL)
                 }
@@ -207,8 +200,6 @@ public actor SubprocessStdioTransport: Transport {
         isConnected = false
         messageContinuation.finish()
         process = nil
-        
-        logger.info("Subprocess transport disconnected")
     }
     
     public func send(_ data: Data) async throws {
@@ -219,11 +210,6 @@ public actor SubprocessStdioTransport: Transport {
         // Add newline delimiter (following official SDK pattern)
         var messageWithNewline = data
         messageWithNewline.append(UInt8(ascii: "\n"))
-        
-        // Log the message being sent for debugging
-        if let messageStr = String(data: data, encoding: .utf8) {
-            logger.debug("Sending message to subprocess: \(messageStr)")
-        }
         
         // Write message in chunks (following official SDK pattern)
         var remaining = messageWithNewline
@@ -243,8 +229,6 @@ public actor SubprocessStdioTransport: Transport {
                 throw MCPError.transportError(error)
             }
         }
-        
-        logger.debug("Sent \(data.count) bytes to subprocess")
     }
     
     public func receive() -> AsyncThrowingStream<Data, Swift.Error> {
@@ -287,7 +271,6 @@ public actor SubprocessStdioTransport: Transport {
                 }
 
                 if bytesRead == 0 {
-                    logger.notice("EOF received from subprocess")
                     break
                 }
 
@@ -299,10 +282,6 @@ public actor SubprocessStdioTransport: Transport {
                     pendingData = pendingData[(newlineIndex + 1)...]
 
                     if !messageData.isEmpty {
-                        logger.debug("Message received from subprocess", metadata: ["size": "\(messageData.count)"])
-                        if let messageStr = String(data: Data(messageData), encoding: .utf8) {
-                            logger.debug("Received message: \(messageStr)")
-                        }
                         messageContinuation.yield(Data(messageData))
                     }
                 }

@@ -191,7 +191,7 @@ struct ServerStatusRow: View {
     }
 }
 
-// MARK: - Placeholder Views
+// MARK: - Tab Views
 
 struct ServersView: View {
     var body: some View {
@@ -438,7 +438,6 @@ struct LogsView: View {
         }
     }
 }
-
 
 #Preview {
     ContentView()

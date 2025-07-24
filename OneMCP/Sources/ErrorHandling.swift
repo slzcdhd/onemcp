@@ -75,94 +75,6 @@ enum ErrorSeverity: String, CaseIterable {
     }
 }
 
-// MARK: - Error Recovery Strategies
-
-protocol ErrorRecoveryStrategy {
-    func canRecover(from error: OneMCPError) -> Bool
-    func recover(from error: OneMCPError) async throws
-}
-
-// MARK: - Network Error Recovery
-
-class NetworkErrorRecovery: ErrorRecoveryStrategy {
-    private let logger = Logger(label: "com.onemcp.recovery.network")
-    private let maxRetries: Int
-    private let baseDelay: TimeInterval
-    
-    init(maxRetries: Int = 3, baseDelay: TimeInterval = 1.0) {
-        self.maxRetries = maxRetries
-        self.baseDelay = baseDelay
-    }
-    
-    func canRecover(from error: OneMCPError) -> Bool {
-        switch error {
-        case .networkError, .mcpProtocolError:
-            return true
-        default:
-            return false
-        }
-    }
-    
-    func recover(from error: OneMCPError) async throws {
-        logger.info("Attempting network error recovery for: \(error.localizedDescription)")
-        
-        for attempt in 1...maxRetries {
-            let delay = baseDelay * Double(attempt)
-            logger.info("Recovery attempt \(attempt)/\(maxRetries), waiting \(delay)s")
-            
-            try await Task.sleep(for: .seconds(delay))
-            
-            // Recovery logic would be implemented by the specific service
-            // This is a base implementation
-            break
-        }
-    }
-}
-
-// MARK: - Service Error Recovery
-
-class ServiceErrorRecovery: ErrorRecoveryStrategy {
-    private let logger = Logger(label: "com.onemcp.recovery.service")
-    
-    func canRecover(from error: OneMCPError) -> Bool {
-        switch error {
-        case .serviceError:
-            return true
-        default:
-            return false
-        }
-    }
-    
-    func recover(from error: OneMCPError) async throws {
-        logger.info("Attempting service error recovery for: \(error.localizedDescription)")
-        
-        // Implement service restart logic
-        // This would be coordinated with the service lifecycle manager
-    }
-}
-
-// MARK: - Configuration Error Recovery
-
-class ConfigurationErrorRecovery: ErrorRecoveryStrategy {
-    private let logger = Logger(label: "com.onemcp.recovery.config")
-    
-    func canRecover(from error: OneMCPError) -> Bool {
-        switch error {
-        case .configurationError, .validationError:
-            return true
-        default:
-            return false
-        }
-    }
-    
-    func recover(from error: OneMCPError) async throws {
-        logger.info("Attempting configuration error recovery for: \(error.localizedDescription)")
-        
-        // Could implement fallback to default configuration
-        // or attempt to fix common configuration issues
-    }
-}
-
 // MARK: - Error Handler
 
 @MainActor
@@ -173,15 +85,6 @@ class ErrorHandler: ObservableObject {
     
     private let logger = Logger(label: "com.onemcp.errorhandler")
     private let maxRecentErrors = 50
-    private let recoveryStrategies: [ErrorRecoveryStrategy]
-    
-    init() {
-        self.recoveryStrategies = [
-            NetworkErrorRecovery(),
-            ServiceErrorRecovery(),
-            ConfigurationErrorRecovery()
-        ]
-    }
     
     func handle(_ error: Swift.Error, context: String = "") async {
         let oneMCPError = convertToOneMCPError(error)
@@ -199,9 +102,6 @@ class ErrorHandler: ObservableObject {
         
         // Log the error
         logger.log(level: oneMCPError.severity.logLevel, "\(oneMCPError.localizedDescription)")
-        
-        // Attempt recovery
-        await attemptRecovery(for: oneMCPError, record: errorRecord)
         
         // Show error dialog for critical errors
         if oneMCPError.severity == .critical {
@@ -233,33 +133,6 @@ class ErrorHandler: ObservableObject {
         
         // Default case
         return .systemError(error.localizedDescription)
-    }
-    
-    private func attemptRecovery(for error: OneMCPError, record: ErrorRecord) async {
-        for strategy in recoveryStrategies {
-            if strategy.canRecover(from: error) {
-                do {
-                    logger.info("Attempting recovery using \(type(of: strategy))")
-                    
-                    // Create a task to isolate the recovery call
-                    try await Task {
-                        try await strategy.recover(from: error)
-                    }.value
-                    
-                    // Mark as recovered
-                    if let index = recentErrors.firstIndex(where: { $0.id == record.id }) {
-                        recentErrors[index].isRecovered = true
-                    }
-                    
-                    logger.info("Successfully recovered from error")
-                    return
-                } catch {
-                    logger.error("Recovery attempt failed: \(error.localizedDescription)")
-                }
-            }
-        }
-        
-        logger.warning("No recovery strategy available for error: \(error.localizedDescription)")
     }
     
     private func sendErrorNotification(_ record: ErrorRecord) async {
@@ -333,7 +206,6 @@ actor CircuitBreaker {
             // Check if we should transition to half-open
             if let lastFailure = lastFailureTime,
                Date().timeIntervalSince(lastFailure) > recoveryTimeout {
-                logger.info("Circuit breaker transitioning to half-open")
                 state = .halfOpen
             } else {
                 throw OneMCPError.serviceError("Circuit breaker is open")
@@ -363,7 +235,6 @@ actor CircuitBreaker {
         lastFailureTime = nil
         
         if state == .halfOpen {
-            logger.info("Circuit breaker transitioning to closed after successful operation")
             state = .closed
         }
     }
@@ -376,7 +247,6 @@ actor CircuitBreaker {
             logger.warning("Circuit breaker opening after \(failureCount) failures")
             state = .open
         } else if state == .halfOpen {
-            logger.warning("Circuit breaker reopening after failed recovery attempt")
             state = .open
         }
     }
@@ -390,7 +260,6 @@ actor CircuitBreaker {
     }
     
     func reset() {
-        logger.info("Circuit breaker reset")
         state = .closed
         failureCount = 0
         lastFailureTime = nil

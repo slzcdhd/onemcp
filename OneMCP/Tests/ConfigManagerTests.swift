@@ -10,8 +10,8 @@ final class ConfigManagerTests: XCTestCase {
         tempDirectory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
         
-        // Use a custom config manager for testing
-        configManager = ConfigManager()
+        // Use a custom config manager with the temporary directory
+        configManager = ConfigManager(configDirectory: tempDirectory)
     }
     
     override func tearDownWithError() throws {
@@ -35,7 +35,7 @@ final class ConfigManagerTests: XCTestCase {
     func testSaveAndLoadConfig() throws {
         // Create a custom configuration
         var config = AppConfig()
-        config.server.port = 8080
+        config.server.port = 4000
         config.server.host = "0.0.0.0"
         config.ui.startMinimized = true
         config.ui.theme = .dark
@@ -61,33 +61,34 @@ final class ConfigManagerTests: XCTestCase {
         // Load configuration and verify
         let loadedConfig = try configManager.loadConfig()
         
-        XCTAssertEqual(loadedConfig.server.port, 8080)
+        XCTAssertEqual(loadedConfig.server.port, 4000)
         XCTAssertEqual(loadedConfig.server.host, "0.0.0.0")
         XCTAssertTrue(loadedConfig.ui.startMinimized)
         XCTAssertEqual(loadedConfig.ui.theme, .dark)
         XCTAssertEqual(loadedConfig.upstreamServers.count, 2)
         
-        // Verify first server
+        // Servers are sorted by name when saved, so "test-http" comes before "test-stdio"
+        // Verify first server (test-http)
         let firstServer = loadedConfig.upstreamServers[0]
-        XCTAssertEqual(firstServer.name, "test-stdio")
-        XCTAssertEqual(firstServer.type, .stdio)
+        XCTAssertEqual(firstServer.name, "test-http")
+        XCTAssertEqual(firstServer.type, .streamableHttp)
         
-        if case .stdio(let stdioConfig) = firstServer.config {
+        if case .streamableHttp(let httpConfig) = firstServer.config {
+            XCTAssertEqual(httpConfig.url.absoluteString, "http://localhost:9000")
+        } else {
+            XCTFail("Expected HTTP configuration")
+        }
+        
+        // Verify second server (test-stdio)
+        let secondServer = loadedConfig.upstreamServers[1]
+        XCTAssertEqual(secondServer.name, "test-stdio")
+        XCTAssertEqual(secondServer.type, .stdio)
+        
+        if case .stdio(let stdioConfig) = secondServer.config {
             XCTAssertEqual(stdioConfig.command, "test-command")
             XCTAssertEqual(stdioConfig.arguments, ["--arg1"])
         } else {
             XCTFail("Expected stdio configuration")
-        }
-        
-        // Verify second server
-        let secondServer = loadedConfig.upstreamServers[1]
-        XCTAssertEqual(secondServer.name, "test-http")
-        XCTAssertEqual(secondServer.type, .streamableHttp)
-        
-        if case .streamableHttp(let httpConfig) = secondServer.config {
-            XCTAssertEqual(httpConfig.url.absoluteString, "http://localhost:9000")
-        } else {
-            XCTFail("Expected HTTP configuration")
         }
     }
     

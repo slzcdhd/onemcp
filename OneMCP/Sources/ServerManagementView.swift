@@ -115,6 +115,25 @@ struct ServerManagementView: View {
                 )
             }
         }
+        .frame(minHeight: 600)
+        .onAppear {
+            // Ensure server statuses are initialized
+            if appState.serverStatuses.isEmpty && !appState.config.upstreamServers.isEmpty {
+                // Initialize statuses for servers that don't have one
+                for server in appState.config.upstreamServers {
+                    if !appState.serverStatuses.contains(where: { $0.id == server.id }) {
+                        let status = ServerStatus(
+                            id: server.id,
+                            name: server.name,
+                            status: .disconnected,
+                            lastError: nil,
+                            capabilities: CapabilityCount(tools: 0, resources: 0, prompts: 0)
+                        )
+                        appState.serverStatuses.append(status)
+                    }
+                }
+            }
+        }
         .sheet(isPresented: $showingAddServer) {
             AddServerView()
                 .environmentObject(appState)
@@ -284,41 +303,9 @@ struct ModernServerCard: View {
     var body: some View {
         VStack(spacing: 0) {
             // Card Content
-            VStack(spacing: 16) {
-                // Header with status and basic info
-                HStack(spacing: 16) {
-                    // Enhanced Status Indicator
-                    ZStack {
-                        // Outer glow effect
-                        Circle()
-                            .fill(statusColor.opacity(0.15))
-                            .frame(width: 60, height: 60)
-                            .scaleEffect(status?.status == .connecting ? 1.1 : 1.0)
-                            .animation(.easeInOut(duration: 2.0).repeatForever(autoreverses: true), value: status?.status == .connecting)
-                        
-                        // Main status circle
-                        Circle()
-                            .fill(
-                                LinearGradient(
-                                    gradient: Gradient(colors: [statusColor, statusColor.opacity(0.8)]),
-                                    startPoint: .topLeading,
-                                    endPoint: .bottomTrailing
-                                )
-                            )
-                            .frame(width: 44, height: 44)
-                            .overlay(
-                                Circle()
-                                    .stroke(statusColor.opacity(0.3), lineWidth: 2)
-                            )
-                        
-                        // Status icon
-                        Image(systemName: statusIcon)
-                            .font(.system(size: 16, weight: .semibold))
-                            .foregroundColor(.white)
-                            .scaleEffect(status?.status == .connecting ? 0.8 : 1.0)
-                            .animation(.easeInOut(duration: 1.0).repeatForever(), value: status?.status == .connecting)
-                    }
-                    
+            VStack(spacing: 12) {
+                // Header with server info and actions
+                HStack(spacing: 12) {
                     // Server Information
                     VStack(alignment: .leading, spacing: 8) {
                         // Server name and type badge
@@ -330,24 +317,24 @@ struct ModernServerCard: View {
                             
                             Spacer()
                             
-                            // Enhanced type badge
+                            // Action buttons group
                             HStack(spacing: 6) {
-                                Image(systemName: server.type.iconName)
-                                    .font(.system(size: 10, weight: .medium))
-                                Text(server.type.displayName)
-                                    .font(.system(size: 11, weight: .medium))
+                                // Edit button
+                                EnhancedActionButton(
+                                    icon: "pencil",
+                                    color: .blue,
+                                    backgroundColor: .blue.opacity(0.1),
+                                    action: onEdit
+                                )
+                                
+                                // Delete button
+                                EnhancedActionButton(
+                                    icon: "trash",
+                                    color: .red,
+                                    backgroundColor: .red.opacity(0.1),
+                                    action: onDelete
+                                )
                             }
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 4)
-                            .background(
-                                Capsule()
-                                    .fill(typeColor.opacity(0.15))
-                            )
-                            .foregroundColor(typeColor)
-                            .overlay(
-                                Capsule()
-                                    .stroke(typeColor.opacity(0.3), lineWidth: 1)
-                            )
                         }
                         
                         // Configuration summary with icon
@@ -362,20 +349,77 @@ struct ModernServerCard: View {
                                 .lineLimit(1)
                         }
                         
-                        // Status and capabilities row
+                        // Status, capabilities and toggle row
                         HStack(spacing: 16) {
-                            // Status badge
-                            HStack(spacing: 6) {
+                            // Combined status and toggle
+                            HStack(spacing: 8) {
+                                // Status indicator
                                 Circle()
                                     .fill(statusColor)
-                                    .frame(width: 6, height: 6)
+                                    .frame(width: 8, height: 8)
                                 
-                                Text(status?.status.displayName ?? "Unknown")
+                                Text(status?.status.displayName ?? "Disconnected")
                                     .font(.system(size: 12, weight: .medium))
                                     .foregroundColor(statusColor)
+                                
+                                // Toggle button integrated with status
+                                Button(action: {
+                                    withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) {
+                                        isToggling = true
+                                        onToggle()
+                                    }
+                                    
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                                        withAnimation(.easeInOut(duration: 0.2)) {
+                                            isToggling = false
+                                        }
+                                    }
+                                }) {
+                                    HStack(spacing: 4) {
+                                        if isToggling {
+                                            ProgressView()
+                                                .scaleEffect(0.4)
+                                                .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                                        } else {
+                                            Image(systemName: server.enabled ? "checkmark.circle.fill" : "circle")
+                                                .font(.system(size: 8, weight: .semibold))
+                                        }
+                                        
+                                        Text(server.enabled ? "On" : "Off")
+                                            .font(.system(size: 9, weight: .medium))
+                                    }
+                                    .foregroundColor(server.enabled ? .white : .secondary)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .frame(minWidth: 40)
+                                    .background(
+                                        Capsule()
+                                            .fill(server.enabled ? 
+                                                  LinearGradient(colors: [.green, .green.opacity(0.8)], startPoint: .leading, endPoint: .trailing) :
+                                                  LinearGradient(colors: [Color.secondary.opacity(0.2), Color.secondary.opacity(0.1)], startPoint: .leading, endPoint: .trailing)
+                                            )
+                                    )
+                                }
+                                .buttonStyle(.plain)
                             }
                             
-                            // Capabilities with enhanced styling
+                            Spacer()
+                            
+                            // Error indicator if present (left of capabilities)
+                            if let lastError = status?.lastError {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "exclamationmark.triangle.fill")
+                                        .font(.system(size: 12))
+                                        .foregroundColor(.orange)
+                                    
+                                    Text("Error")
+                                        .font(.system(size: 12, weight: .medium))
+                                        .foregroundColor(.orange)
+                                }
+                                .help(lastError)
+                            }
+                            
+                            // Capabilities with enhanced styling - right aligned
                             if let status = status, status.capabilities.total > 0 {
                                 HStack(spacing: 4) {
                                     Image(systemName: "gearshape.2.fill")
@@ -397,92 +441,7 @@ struct ModernServerCard: View {
                                         .fill(Color.blue.opacity(0.1))
                                 )
                             }
-                            
-                            Spacer()
-                            
-                            // Error indicator if present
-                            if let lastError = status?.lastError {
-                                HStack(spacing: 4) {
-                                    Image(systemName: "exclamationmark.triangle.fill")
-                                        .font(.system(size: 12))
-                                        .foregroundColor(.orange)
-                                    
-                                    Text("Error")
-                                        .font(.system(size: 12, weight: .medium))
-                                        .foregroundColor(.orange)
-                                }
-                                .help(lastError)
-                            }
                         }
-                    }
-                }
-                
-                // Enhanced Action Buttons Row
-                HStack(spacing: 10) {
-                    // Compact toggle button
-                    Button(action: {
-                        withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) {
-                            isToggling = true
-                            onToggle()
-                        }
-                        
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                            withAnimation(.easeInOut(duration: 0.2)) {
-                                isToggling = false
-                            }
-                        }
-                    }) {
-                        HStack(spacing: 4) {
-                            if isToggling {
-                                ProgressView()
-                                    .scaleEffect(0.5)
-                                    .progressViewStyle(CircularProgressViewStyle(tint: .white))
-                            } else {
-                                Image(systemName: server.enabled ? "checkmark.circle.fill" : "circle")
-                                    .font(.system(size: 10, weight: .semibold))
-                            }
-                            
-                            Text(server.enabled ? "Enabled" : "Disabled")
-                                .font(.system(size: 10, weight: .medium))
-                        }
-                        .foregroundColor(server.enabled ? .white : .secondary)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .frame(minWidth: 60)
-                        .background(
-                            Capsule()
-                                .fill(server.enabled ? 
-                                      LinearGradient(colors: [.green, .green.opacity(0.8)], startPoint: .leading, endPoint: .trailing) :
-                                      LinearGradient(colors: [Color.secondary.opacity(0.2), Color.secondary.opacity(0.1)], startPoint: .leading, endPoint: .trailing)
-                                )
-                        )
-                        .overlay(
-                            Capsule()
-                                .stroke(server.enabled ? Color.green.opacity(0.3) : Color.secondary.opacity(0.2), lineWidth: 1)
-                        )
-                    }
-                    .buttonStyle(.plain)
-                    .scaleEffect(isHovered ? 1.01 : 1.0)
-                    
-                    Spacer()
-                    
-                    // Action buttons group
-                    HStack(spacing: 6) {
-                        // Edit button
-                        EnhancedActionButton(
-                            icon: "pencil",
-                            color: .blue,
-                            backgroundColor: .blue.opacity(0.1),
-                            action: onEdit
-                        )
-                        
-                        // Delete button
-                        EnhancedActionButton(
-                            icon: "trash",
-                            color: .red,
-                            backgroundColor: .red.opacity(0.1),
-                            action: onDelete
-                        )
                     }
                 }
             }
@@ -870,9 +829,21 @@ struct AddServerView: View {
                             .font(.headline)
                             .fontWeight(.medium)
                         
-                        VStack(spacing: 0) {
+                        ZStack(alignment: .topLeading) {
+                            // Always show the TextEditor
+                            TextEditor(text: $configurationJSON)
+                                .font(.system(.body, design: .monospaced))
+                                .frame(minHeight: 200)
+                                .padding(8)
+                                .background(Color(NSColor.textBackgroundColor))
+                                .cornerRadius(8)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 8)
+                                        .stroke(Color.secondary.opacity(0.3), lineWidth: 1)
+                                )
+                            
+                            // Show example text as overlay when empty
                             if configurationJSON.isEmpty {
-                                // Show example text when empty
                                 VStack {
                                     HStack {
                                         Text("Example:")
@@ -895,29 +866,7 @@ struct AddServerView: View {
                                     
                                     Spacer()
                                 }
-                                .frame(minHeight: 200)
-                                .background(Color(NSColor.textBackgroundColor))
-                                .cornerRadius(8)
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 8)
-                                        .stroke(Color.secondary.opacity(0.3), lineWidth: 1)
-                                )
-                                .onTapGesture {
-                                    // Focus the text editor when tapped
-                                    configurationJSON = ""
-                                }
-                            } else {
-                                // Show text editor when not empty
-                                TextEditor(text: $configurationJSON)
-                                    .font(.system(.body, design: .monospaced))
-                                    .frame(minHeight: 200)
-                                    .padding(8)
-                                    .background(Color(NSColor.textBackgroundColor))
-                                    .cornerRadius(8)
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: 8)
-                                            .stroke(Color.secondary.opacity(0.3), lineWidth: 1)
-                                    )
+                                .allowsHitTesting(false) // Allow clicks to pass through to TextEditor
                             }
                         }
                     }
@@ -935,12 +884,24 @@ struct AddServerView: View {
     
     private var stdioExampleText: String {
         return """
+// For stdio servers (required: command):
 {
   "command": "npx",
-  "args": ["@modelcontextprotocol/server-playwright"],
-  "env": {
+  "args": ["@modelcontextprotocol/server-playwright"],  // optional
+  "env": {                                               // optional
     "HEADLESS": "true"
   }
+}
+
+// Minimal stdio example:
+{
+  "command": "/usr/local/bin/my-mcp-server"
+}
+
+// For HTTP servers (required: url):
+{
+  "url": "http://localhost:3000",
+  "type": "sse"  // optional, defaults to "streamable-http"
 }
 """
     }
@@ -978,9 +939,9 @@ struct AddServerView: View {
     
     private func createServerConfig(name: String, config: [String: Any]) throws -> ServerConfig {
         // Auto-detect server type based on configuration
-        if let command = config["command"] as? String,
-           let args = config["args"] as? [String] {
+        if let command = config["command"] as? String {
             // This is a stdio server
+            let args = config["args"] as? [String] ?? []  // args is optional, default to empty array
             let environment = config["env"] as? [String: String]
             let workingDirectory = config["workingDirectory"] as? String
             
@@ -1213,9 +1174,9 @@ struct EditServerView: View {
     
     private func createServerConfig(name: String, config: [String: Any]) throws -> ServerConfig {
         // Auto-detect server type based on configuration (same as AddServerView)
-        if let command = config["command"] as? String,
-           let args = config["args"] as? [String] {
+        if let command = config["command"] as? String {
             // This is a stdio server
+            let args = config["args"] as? [String] ?? []  // args is optional, default to empty array
             let environment = config["env"] as? [String: String]
             let workingDirectory = config["workingDirectory"] as? String
             
@@ -1361,7 +1322,7 @@ enum ConfigurationError: LocalizedError {
         case .invalidURL:
             return "Invalid URL format"
         case .invalidConfiguration:
-            return "Invalid configuration format. Please provide either stdio config (command + args) or URL config."
+            return "Invalid configuration format. For stdio servers: 'command' is required. For HTTP servers: 'url' is required."
         }
     }
 }

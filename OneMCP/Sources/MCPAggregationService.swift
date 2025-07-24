@@ -1,11 +1,10 @@
 import Foundation
 import MCP
-import ServiceLifecycle
 import Logging
 import Network
 
 protocol MCPAggregationServiceDelegate: AnyObject, Sendable {
-    func serviceDidUpdateServerStatus(_ status: ServerStatus) async
+    func serviceDidUpdateServerStatuses(_ statuses: [ServerStatus]) async
     func serviceDidUpdateCapabilities(_ capabilities: [AggregatedCapability]) async
     func serviceDidLogMessage(_ message: String, level: LogLevel) async
 }
@@ -17,50 +16,70 @@ class MCPAggregationService: ObservableObject {
     private let logger = Logger(label: "com.onemcp.aggregationservice")
     private var mcpServer: MCP.Server?
     private var upstreamManager: UpstreamManager?
-    private var serviceGroup: ServiceGroup?
+    private var serverTask: Task<Void, Never>?
     private var isRunning = false
     
     private var currentConfig: AppConfig?
     
-    func start(config: AppConfig) async throws {
+    func start(with config: AppConfig) async throws {
         guard !isRunning else { return }
         
         currentConfig = config
         
-        // For now, always use the configured port to avoid false positives
-        // Port conflicts will be handled by the actual server startup
-        logger.info("Using configured port: \(config.server.port)")
-        currentConfig = config
+        // Initialize server and upstream manager
+        mcpServer = MCP.Server(
+            name: "onemcp-aggregator",
+            version: "1.0.0",
+            capabilities: .init(
+                prompts: .init(listChanged: true),
+                resources: .init(subscribe: true, listChanged: true),
+                tools: .init(listChanged: true)
+            )
+        )
         
-        // Create upstream manager
+        // Register method handlers
+        await setupServerHandlers(mcpServer!)
+        
         upstreamManager = UpstreamManager(delegate: self)
         
-        // Create and configure MCP server
-        mcpServer = await createMCPServer(config: currentConfig!)
-        
-        // Start services in background task to avoid blocking
-        Task {
-            do {
-                let services: [any Service] = [
-                    upstreamManager!,
-                    MCPServerService(server: mcpServer!, config: currentConfig!, aggregationService: self)
-                ]
-                
-                serviceGroup = ServiceGroup(
-                    services: services,
-                    gracefulShutdownSignals: [.sigterm, .sigint],
-                    logger: logger
-                )
-                
-                try await serviceGroup!.run()
-            } catch {
-                logger.error("ServiceGroup failed: \(error)")
-                await delegate?.serviceDidLogMessage("MCP service group failed: \(error.localizedDescription)", level: .error)
-                
-                // Attempt to restart with a different port if it's a port conflict
-                if error.localizedDescription.contains("Address already in use") {
-                    logger.info("Port conflict detected, attempting to restart with alternative port...")
-                    await restartWithAlternativePort()
+        // Start the server
+        serverTask = Task {
+            var retryCount = 0
+            let maxRetries = 3
+            let retryDelay: TimeInterval = 2.0
+            
+            while retryCount < maxRetries && !Task.isCancelled {
+                do {
+                    let transport = HTTPServerTransport(
+                        host: config.server.host,
+                        port: config.server.port,
+                        enableCORS: config.server.enableCors,
+                        aggregationService: self,
+                        logger: logger
+                    )
+                    
+                    try await transport.start(with: mcpServer!)
+                    
+                    // Keep the service running
+                    while !Task.isCancelled {
+                        try await Task.sleep(for: .seconds(1))
+                    }
+                    break
+                    
+                } catch {
+                    retryCount += 1
+                    logger.error("MCP server start attempt \(retryCount) failed: \(error)")
+                    await delegate?.serviceDidLogMessage("MCP server start attempt \(retryCount) failed: \(error.localizedDescription)", level: .error)
+                    
+                    if retryCount < maxRetries {
+                        try? await Task.sleep(for: .seconds(retryDelay))
+                    } else {
+                        // Final failure - attempt to restart with a different port if it's a port conflict
+                        if error.localizedDescription.contains("Address already in use") {
+                            await restartWithAlternativePort()
+                        }
+                        break
+                    }
                 }
             }
         }
@@ -74,6 +93,24 @@ class MCPAggregationService: ObservableObject {
         await delegate?.serviceDidLogMessage("MCP aggregation service started on \(currentConfig!.server.host):\(currentConfig!.server.port)", level: .info)
     }
     
+    func connectNewServer(_ serverConfig: ServerConfig) async {
+        guard isRunning else { 
+            logger.warning("Cannot connect new server - service not running")
+            return 
+        }
+        
+        // Connect only the new server without affecting existing connections
+        await upstreamManager?.connectSpecificServer(serverConfig)
+        
+        await delegate?.serviceDidLogMessage("Connected new server: \(serverConfig.name)", level: .info)
+    }
+    
+    func disconnectSpecificServer(id: UUID) async {
+        guard isRunning else { return }
+        
+        await upstreamManager?.disconnectSpecificServer(id: id)
+    }
+    
     func stop() async throws {
         guard isRunning else { return }
         
@@ -81,12 +118,12 @@ class MCPAggregationService: ObservableObject {
         
         // Gracefully stop all services
         if let upstream = upstreamManager {
-            await upstream.gracefulShutdown()
+            await upstream.shutdown()
         }
         
-        // Note: ServiceGroup doesn't have a direct shutdown method in this version
-        // We rely on service cancellation to clean up
-        serviceGroup = nil
+        // Cancel the server task
+        serverTask?.cancel()
+        serverTask = nil
         upstreamManager = nil
         mcpServer = nil
         
@@ -99,7 +136,7 @@ class MCPAggregationService: ObservableObject {
             // Add a small delay to ensure clean shutdown
             try await Task.sleep(for: .milliseconds(500))
         }
-        try await start(config: config)
+        try await start(with: config)
     }
     
     private func restartWithAlternativePort() async {
@@ -113,7 +150,7 @@ class MCPAggregationService: ObservableObject {
             var updatedConfig = config
             updatedConfig.server.port = alternativePort
             
-            try await start(config: updatedConfig)
+            try await start(with: updatedConfig)
             
             await delegate?.serviceDidLogMessage("Service restarted successfully on port \(alternativePort)", level: .info)
         } catch {
@@ -189,23 +226,6 @@ class MCPAggregationService: ObservableObject {
         return Int.random(in: 8000...9999)
     }
     
-    private func createMCPServer(config: AppConfig) async -> MCP.Server {
-        let server = MCP.Server(
-            name: "onemcp-aggregator",
-            version: "1.0.0",
-            capabilities: .init(
-                prompts: .init(listChanged: true),
-                resources: .init(subscribe: true, listChanged: true),
-                tools: .init(listChanged: true)
-            )
-        )
-        
-        // Register method handlers
-        await setupServerHandlers(server)
-        
-        return server
-    }
-    
     private func setupServerHandlers(_ server: MCP.Server) async {
         // List tools handler
         await server.withMethodHandler(MCP.ListTools.self) { [weak self] _ in
@@ -273,21 +293,21 @@ class MCPAggregationService: ObservableObject {
     
     // MARK: - Public API for HTTP Server
     
-    nonisolated func getAggregatedTools() async -> [MCP.Tool] {
+    nonisolated func getTools() async -> [MCP.Tool] {
         guard let upstreamManager = await self.upstreamManager else {
             return []
         }
         return await upstreamManager.getAggregatedTools()
     }
     
-    nonisolated func getAggregatedResources() async -> [MCP.Resource] {
+    nonisolated func getResources() async -> [MCP.Resource] {
         guard let upstreamManager = await self.upstreamManager else {
             return []
         }
         return await upstreamManager.getAggregatedResources()
     }
     
-    nonisolated func getAggregatedPrompts() async -> [MCP.Prompt] {
+    nonisolated func getPrompts() async -> [MCP.Prompt] {
         guard let upstreamManager = await self.upstreamManager else {
             return []
         }
@@ -300,7 +320,8 @@ class MCPAggregationService: ObservableObject {
         }
         // Use MCPArguments wrapper for thread-safe argument passing
         let mcpArgs = MCPArguments(arguments)
-        return try await upstreamManager.callTool(name: name, arguments: mcpArgs.toAnyDict())
+        let result = try await upstreamManager.callTool(name: name, arguments: mcpArgs.toAnyDict())
+        return (content: result.content, isError: result.isError ?? false)
     }
     
     nonisolated func readResource(uri: String) async throws -> [MCP.Resource.Content] {
@@ -328,99 +349,21 @@ class MCPAggregationService: ObservableObject {
         logger.info("Connecting specific server: \(serverConfig.name)")
         await upstreamManager.connectSpecificServer(serverConfig)
     }
-    
-    func disconnectSpecificServer(id: UUID) async {
-        guard isRunning, let upstreamManager = upstreamManager else {
-            logger.warning("Cannot disconnect server with id \(id) - service not running")
-            return
-        }
-        
-        logger.info("Disconnecting specific server with id: \(id)")
-        await upstreamManager.disconnectSpecificServer(id: id)
-    }
 }
 
 // MARK: - UpstreamManagerDelegate
 
 extension MCPAggregationService: UpstreamManagerDelegate {
-    func upstreamManagerDidUpdateServerStatus(_ status: ServerStatus) async {
-        await delegate?.serviceDidUpdateServerStatus(status)
+    func upstreamManagerDidUpdateStatuses(_ statuses: [ServerStatus]) async {
+        await delegate?.serviceDidUpdateServerStatuses(statuses)
     }
     
     func upstreamManagerDidUpdateCapabilities(_ capabilities: [AggregatedCapability]) async {
         await delegate?.serviceDidUpdateCapabilities(capabilities)
-        
-        // Notify MCP server of capability changes
-        if mcpServer != nil {
-            // Send notifications to connected clients about capability changes
-            // Note: Notifications implementation depends on the specific MCP SDK version
-        }
     }
     
     func upstreamManagerDidLogMessage(_ message: String, level: LogLevel) async {
         await delegate?.serviceDidLogMessage(message, level: level)
-    }
-}
-
-// MARK: - MCPServerService
-
-struct MCPServerService: Service {
-    let server: MCP.Server
-    let config: AppConfig
-    weak var aggregationService: MCPAggregationService?
-    private let logger = Logger(label: "com.onemcp.serverservice")
-    private let maxRetries = 3
-    private let retryDelay: TimeInterval = 2.0
-    
-    init(server: MCP.Server, config: AppConfig, aggregationService: MCPAggregationService?) {
-        self.server = server
-        self.config = config
-        self.aggregationService = aggregationService
-    }
-    
-    func run() async throws {
-        logger.info("Starting MCP streamable HTTP server on \(config.server.host):\(config.server.port)")
-        
-        var retryCount = 0
-        var lastError: Swift.Error?
-        
-        while retryCount < maxRetries {
-            do {
-                // Use the existing port availability check from the service
-                let finalPort = config.server.port
-                // For now, just use the configured port
-                
-                let transport = HTTPServerTransport(
-                    host: config.server.host,
-                    port: finalPort,
-                    enableCORS: config.server.enableCors,
-                    aggregationService: aggregationService,
-                    logger: logger
-                )
-                
-                try await transport.start(with: server)
-                logger.info("MCP streamable HTTP server started successfully on port \(finalPort)")
-                
-                // Keep the service running indefinitely
-                while !Task.isCancelled {
-                    try await Task.sleep(for: .seconds(1))
-                }
-                break
-                
-            } catch {
-                retryCount += 1
-                lastError = error
-                logger.warning("MCP server start attempt \(retryCount) failed: \(error)")
-                
-                if retryCount < maxRetries {
-                    logger.info("Retrying in \(retryDelay) seconds...")
-                    try await Task.sleep(for: .seconds(retryDelay))
-                } else {
-                    logger.error("Failed to start MCP server after \(maxRetries) attempts")
-                    throw lastError ?? MCPError.internalError("Unknown error during server startup")
-                }
-            }
-        }
     }
 }
 

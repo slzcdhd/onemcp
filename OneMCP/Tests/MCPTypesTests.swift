@@ -225,11 +225,17 @@ final class MCPTypesTests: XCTestCase {
     
     func testUnsupportedTypeConversion() {
         // Test conversion of unsupported types (should convert to string)
-        let testDate = Date()
-        let mcpValue = convertAnyToMCPValue(testDate)
+        // Use a custom type that will have a predictable string representation
+        struct CustomType {
+            let value: String = "test"
+        }
+        
+        let customValue = CustomType()
+        let mcpValue = convertAnyToMCPValue(customValue)
         
         if case .string(let value) = mcpValue {
-            XCTAssertTrue(value.contains("Date"))
+            // String(describing:) will produce "CustomType(value: \"test\")"
+            XCTAssertTrue(value.contains("CustomType"))
         } else {
             XCTFail("Expected string MCP value for unsupported type")
         }

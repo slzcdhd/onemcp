@@ -1,37 +1,122 @@
 import SwiftUI
+@preconcurrency import Darwin
 
 // MARK: - Advanced Settings
 
 struct AdvancedSettingsView: View {
     @EnvironmentObject var appState: AppState
+    @State private var selectedTab = 0
     
     var body: some View {
-        TabView {
-            MCPConfigurationView()
-                .environmentObject(appState)
-                .tabItem {
-                    Label("MCP Config", systemImage: "doc.text.fill")
-                }
+        VStack(spacing: 0) {
+            // Custom Tab Bar
+            HStack(spacing: 0) {
+                CustomTabButton(
+                    title: "MCP Config",
+                    icon: "doc.text.fill",
+                    isSelected: selectedTab == 0,
+                    action: { selectedTab = 0 }
+                )
+                
+                CustomTabButton(
+                    title: "Logging",
+                    icon: "text.alignleft",
+                    isSelected: selectedTab == 1,
+                    action: { selectedTab = 1 }
+                )
+                
+                CustomTabButton(
+                    title: "Diagnostics",
+                    icon: "stethoscope",
+                    isSelected: selectedTab == 2,
+                    action: { selectedTab = 2 }
+                )
+                
+                CustomTabButton(
+                    title: "System",
+                    icon: "gear.circle",
+                    isSelected: selectedTab == 3,
+                    action: { selectedTab = 3 }
+                )
+            }
+            .background(Color(NSColor.controlBackgroundColor))
             
-            LoggingConfigurationView()
-                .environmentObject(appState)
-                .tabItem {
-                    Label("Logging", systemImage: "text.alignleft")
-                }
+            Divider()
             
-            DiagnosticsView()
-                .environmentObject(appState)
-                .tabItem {
-                    Label("Diagnostics", systemImage: "stethoscope")
+            // Tab Content
+            Group {
+                switch selectedTab {
+                case 0:
+                    MCPConfigurationView()
+                        .environmentObject(appState)
+                case 1:
+                    LoggingConfigurationView()
+                        .environmentObject(appState)
+                case 2:
+                    DiagnosticsView()
+                        .environmentObject(appState)
+                case 3:
+                    SystemConfigurationView()
+                        .environmentObject(appState)
+                default:
+                    MCPConfigurationView()
+                        .environmentObject(appState)
                 }
-            
-            SystemConfigurationView()
-                .environmentObject(appState)
-                .tabItem {
-                    Label("System", systemImage: "gear.circle")
-                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+struct CustomTabButton: View {
+    let title: String
+    let icon: String
+    let isSelected: Bool
+    let action: () -> Void
+    
+    @State private var isHovered = false
+    
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 4) {
+                Image(systemName: icon)
+                    .font(.system(size: 20, weight: .medium))
+                    .foregroundColor(isSelected ? .blue : (isHovered ? .primary : .secondary))
+                
+                Text(title)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(isSelected ? .blue : (isHovered ? .primary : .secondary))
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 12)
+            .background(
+                VStack(spacing: 0) {
+                    if isSelected {
+                        Color.blue.opacity(0.1)
+                    } else if isHovered {
+                        Color.primary.opacity(0.05)
+                    } else {
+                        Color.clear
+                    }
+                }
+            )
+            .overlay(
+                VStack {
+                    Spacer()
+                    if isSelected {
+                        Rectangle()
+                            .fill(Color.blue)
+                            .frame(height: 2)
+                    }
+                }
+            )
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            withAnimation(.easeInOut(duration: 0.15)) {
+                isHovered = hovering
+            }
+        }
     }
 }
 
@@ -509,14 +594,20 @@ struct DiagnosticsView: View {
         }
     }
     
+    // Helper function to access mach_task_self_ safely
+    private static func getTaskPort() -> mach_port_t {
+        return mach_task_self_
+    }
+    
     private func formatMemoryUsage() -> String {
-        let task = mach_task_self_
         var info = mach_task_basic_info()
         var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size) / 4
         
-        let kerr: kern_return_t = withUnsafeMutablePointer(to: &info) {
-            $0.withMemoryRebound(to: integer_t.self, capacity: 1) {
-                task_info(task, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
+        let task = Self.getTaskPort()
+        
+        let kerr: kern_return_t = withUnsafeMutablePointer(to: &info) { infoPtr in
+            infoPtr.withMemoryRebound(to: integer_t.self, capacity: 1) { reboundPtr in
+                task_info(task, task_flavor_t(MACH_TASK_BASIC_INFO), reboundPtr, &count)
             }
         }
         

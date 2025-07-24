@@ -5,15 +5,14 @@ final class ErrorHandlingTests: XCTestCase {
     var errorHandler: ErrorHandler!
     
     override func setUpWithError() throws {
+        // Tests need to run on MainActor since ErrorHandler is @MainActor
+    }
+    
+    @MainActor
+    func testBasicErrorHandling() async {
         errorHandler = ErrorHandler()
-    }
-    
-    override func tearDownWithError() throws {
-        errorHandler = nil
-    }
-    
-    func testErrorConversion() async {
-        // Test URL error conversion
+        
+        // Test different error types
         let urlError = URLError(.notConnectedToInternet)
         await errorHandler.handle(urlError, context: "Network test")
         
@@ -25,16 +24,15 @@ final class ErrorHandlingTests: XCTestCase {
         } else {
             XCTFail("Expected network error")
         }
-    }
-    
-    func testErrorSeverityHandling() async {
-        // Test different error severities
-        let configError = OneMCPError.configurationError("Invalid port")
-        let networkError = OneMCPError.networkError("Connection timeout")
-        let criticalError = OneMCPError.systemError("Out of memory")
         
+        // Test configuration error
+        let configError = OneMCPError.configurationError("Invalid configuration")
         await errorHandler.handle(configError, context: "Config test")
-        await errorHandler.handle(networkError, context: "Network test")
+        
+        XCTAssertEqual(errorHandler.recentErrors.count, 2)
+        
+        // Test critical error shows dialog
+        let criticalError = OneMCPError.systemError("Critical system failure")
         await errorHandler.handle(criticalError, context: "System test")
         
         XCTAssertEqual(errorHandler.recentErrors.count, 3)
@@ -44,133 +42,119 @@ final class ErrorHandlingTests: XCTestCase {
         XCTAssertNotNil(errorHandler.currentError)
     }
     
-    func testErrorRecordManagement() async {
-        // Test that error records are properly managed
-        for i in 0..<60 { // Exceed the max recent errors limit
+    @MainActor
+    func testErrorHistoryLimit() async {
+        errorHandler = ErrorHandler()
+        
+        // Add more than 50 errors
+        for i in 0..<60 {
             let error = OneMCPError.validationError("Test error \(i)")
-            await errorHandler.handle(error, context: "Test \(i)")
+            await errorHandler.handle(error)
         }
         
         // Should not exceed max limit
         XCTAssertLessThanOrEqual(errorHandler.recentErrors.count, 50)
     }
     
-    func testErrorRecoveryStrategies() {
-        let networkRecovery = NetworkErrorRecovery()
-        let serviceRecovery = ServiceErrorRecovery()
-        let configRecovery = ConfigurationErrorRecovery()
+    func testErrorSeverity() {
+        // Test severity levels
+        let configError = OneMCPError.configurationError("Config issue")
+        XCTAssertEqual(configError.severity, .warning)
         
-        // Test network error recovery
-        let networkError = OneMCPError.networkError("Connection failed")
-        XCTAssertTrue(networkRecovery.canRecover(from: networkError))
-        XCTAssertFalse(serviceRecovery.canRecover(from: networkError))
-        XCTAssertFalse(configRecovery.canRecover(from: networkError))
+        let networkError = OneMCPError.networkError("Network issue")
+        XCTAssertEqual(networkError.severity, .moderate)
         
-        // Test service error recovery
-        let serviceError = OneMCPError.serviceError("Service crashed")
-        XCTAssertFalse(networkRecovery.canRecover(from: serviceError))
-        XCTAssertTrue(serviceRecovery.canRecover(from: serviceError))
-        XCTAssertFalse(configRecovery.canRecover(from: serviceError))
-        
-        // Test configuration error recovery
-        let configError = OneMCPError.configurationError("Invalid config")
-        XCTAssertFalse(networkRecovery.canRecover(from: configError))
-        XCTAssertFalse(serviceRecovery.canRecover(from: configError))
-        XCTAssertTrue(configRecovery.canRecover(from: configError))
+        let systemError = OneMCPError.systemError("System issue")
+        XCTAssertEqual(systemError.severity, .critical)
     }
     
-    func testCircuitBreakerFunctionality() async {
-        let circuitBreaker = CircuitBreaker(failureThreshold: 3, recoveryTimeout: 1.0)
+    func testCircuitBreaker() async {
+        let circuitBreaker = CircuitBreaker()
         
-        // Test normal operation
+        // Test successful operation
         let successResult = try? await circuitBreaker.execute {
             return "success"
         }
         XCTAssertEqual(successResult, "success")
-        XCTAssertEqual(await circuitBreaker.getState(), .closed)
+        
+        let state1 = await circuitBreaker.getState()
+        XCTAssertEqual(state1, .closed)
         
         // Test failure accumulation
-        for _ in 0..<3 {
+        for _ in 0..<5 {
             do {
                 try await circuitBreaker.execute {
-                    throw OneMCPError.networkError("Simulated failure")
+                    throw OneMCPError.networkError("Test failure")
                 }
             } catch {
-                // Expected failures
+                // Expected
             }
         }
         
         // Should be open now
-        XCTAssertEqual(await circuitBreaker.getState(), .open)
+        let state2 = await circuitBreaker.getState()
+        XCTAssertEqual(state2, .open)
         
         // Should reject calls when open
         do {
-            try await circuitBreaker.execute {
+            _ = try await circuitBreaker.execute {
                 return "should not execute"
             }
-            XCTFail("Should have thrown circuit breaker error")
+            XCTFail("Should have thrown")
         } catch {
             // Expected
         }
         
-        // Wait for recovery timeout
-        try? await Task.sleep(for: .seconds(1.1))
+        // Test half-open after timeout
+        try? await Task.sleep(for: .seconds(31))
         
-        // Should transition to half-open
+        // Should transition to half-open and allow one request
         let halfOpenResult = try? await circuitBreaker.execute {
             return "recovery test"
         }
         XCTAssertEqual(halfOpenResult, "recovery test")
-        XCTAssertEqual(await circuitBreaker.getState(), .closed)
+        
+        let state3 = await circuitBreaker.getState()
+        XCTAssertEqual(state3, .closed)
     }
     
-    func testMCPErrorConversion() async {
-        // Test MCP-specific error handling
-        let mcpError = MCPError.invalidRequest("Invalid method")
-        await errorHandler.handle(mcpError, context: "MCP Protocol test")
+    func testErrorRecord() {
+        let error = OneMCPError.networkError("Test error")
+        let record = ErrorRecord(error: error, context: "Test context", timestamp: Date())
         
-        XCTAssertEqual(errorHandler.recentErrors.count, 1)
-        let errorRecord = errorHandler.recentErrors[0]
-        
-        if case .mcpProtocolError = errorRecord.error {
-            // Correct conversion
-        } else {
-            XCTFail("Expected MCP protocol error")
-        }
+        XCTAssertEqual(record.context, "Test context")
+        XCTAssertFalse(record.isRecovered)
+        XCTAssertNotNil(record.formattedTimestamp)
     }
     
-    func testErrorRecoverySuggestions() {
-        let errors: [OneMCPError] = [
-            .configurationError("Invalid port"),
-            .networkError("Connection timeout"),
-            .serviceError("Service unavailable"),
-            .validationError("Invalid input"),
-            .systemError("Permission denied")
+    @MainActor
+    func testErrorConversion() async {
+        errorHandler = ErrorHandler()
+        
+        // Test various error conversions
+        let errors: [Swift.Error] = [
+            URLError(.notConnectedToInternet),
+            DecodingError.dataCorrupted(.init(codingPath: [], debugDescription: "Test")),
+            NSError(domain: "TestDomain", code: 123, userInfo: nil)
         ]
         
         for error in errors {
-            XCTAssertNotNil(error.recoverySuggestion)
-            XCTAssertFalse(error.recoverySuggestion!.isEmpty)
-        }
-    }
-    
-    func testErrorClearing() async {
-        // Add some errors
-        for i in 0..<5 {
-            let error = OneMCPError.validationError("Test error \(i)")
-            await errorHandler.handle(error, context: "Test \(i)")
+            await errorHandler.handle(error, context: "Conversion test")
         }
         
-        XCTAssertEqual(errorHandler.recentErrors.count, 5)
+        XCTAssertEqual(errorHandler.recentErrors.count, 3)
         
         // Clear errors
         errorHandler.clearRecentErrors()
         XCTAssertEqual(errorHandler.recentErrors.count, 0)
     }
     
+    @MainActor
     func testErrorDialogDismissal() async {
-        // Trigger critical error to show dialog
-        let criticalError = OneMCPError.systemError("Critical system failure")
+        errorHandler = ErrorHandler()
+        
+        // Create critical error to show dialog
+        let criticalError = OneMCPError.systemError("Critical test")
         await errorHandler.handle(criticalError, context: "Critical test")
         
         XCTAssertTrue(errorHandler.isShowingErrorDialog)

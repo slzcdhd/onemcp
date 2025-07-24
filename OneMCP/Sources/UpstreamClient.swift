@@ -24,8 +24,6 @@ actor UpstreamClient {
     func connect() async throws {
         guard !isConnected else { return }
         
-        logger.info("Attempting to connect to \(config.name)")
-        
         // Create client (following official SDK pattern)
         let newClient = MCP.Client(
             name: "onemcp-client",
@@ -36,7 +34,7 @@ actor UpstreamClient {
         let transport = try await createTransport()
         
         // Connect to server with retry logic using circuit breaker
-        let result = try await circuitBreaker.execute {
+        _ = try await circuitBreaker.execute {
             return try await newClient.connect(transport: transport)
         }
         
@@ -44,8 +42,6 @@ actor UpstreamClient {
         client = newClient
         isConnected = true
         retryCount = 0
-        
-        logger.info("Connected to \(config.name), server capabilities: \(result.capabilities)")
         
         // Load capabilities with timeout - if this fails, we should still consider the connection successful
         do {
@@ -72,8 +68,6 @@ actor UpstreamClient {
     func disconnect() async {
         guard isConnected else { return }
         
-        logger.info("Disconnecting from \(config.name)")
-        
         // TODO: Find correct method to close client connection
         // client?.close() does not exist in this SDK version
         client = nil
@@ -86,11 +80,8 @@ actor UpstreamClient {
     }
     
     private func createTransport() async throws -> any Transport {
-        logger.info("Creating transport for \(config.name) of type \(config.type)")
-        
         switch config.config {
         case .stdio(let stdioConfig):
-            logger.info("Creating stdio transport: \(stdioConfig.command) \(stdioConfig.arguments.joined(separator: " "))")
             // Use our custom subprocess transport for stdio servers
             let transport = SubprocessStdioTransport(
                 command: stdioConfig.command,
@@ -102,7 +93,6 @@ actor UpstreamClient {
             return transport
             
         case .sse(let sseConfig):
-            logger.info("Creating Legacy SSE transport to: \(sseConfig.url)")
             // Use our custom LegacySSETransport for servers that use separate SSE and POST endpoints
             let transport = LegacySSETransport(
                 sseEndpoint: sseConfig.url,
@@ -111,7 +101,6 @@ actor UpstreamClient {
             return transport
             
         case .streamableHttp(let httpConfig):
-            logger.info("Creating HTTP transport to: \(httpConfig.url)")
             // Use HTTPClientTransport for streamable HTTP
             let transport = HTTPClientTransport(
                 endpoint: httpConfig.url,
@@ -124,53 +113,40 @@ actor UpstreamClient {
     
     private func loadCapabilities() async throws {
         guard let client = client, isConnected else { 
-            logger.warning("Cannot load capabilities - client not connected")
             return 
         }
         
-        logger.info("Starting to load capabilities from \(config.name)")
-        
         do {
             // Load tools (most servers support this)
-            logger.debug("Loading tools from \(config.name)")
             do {
                 let toolsResult = try await circuitBreaker.execute {
                     return try await client.listTools()
                 }
                 tools = toolsResult.tools
-                logger.info("Loaded \(tools.count) tools from \(config.name): \(tools.map { $0.name }.joined(separator: ", "))")
             } catch {
                 logger.warning("Failed to load tools from \(config.name): \(error)")
                 tools = []
             }
             
             // Load resources (try but don't fail if unsupported)
-            logger.debug("Loading resources from \(config.name)")
             do {
                 let resourcesResult = try await circuitBreaker.execute {
                     return try await client.listResources()
                 }
                 resources = resourcesResult.resources
-                logger.info("Loaded \(resources.count) resources from \(config.name)")
             } catch {
-                logger.debug("Resources not supported by \(config.name): \(error)")
                 resources = []
             }
             
             // Load prompts (try but don't fail if unsupported)
-            logger.debug("Loading prompts from \(config.name)")
             do {
                 let promptsResult = try await circuitBreaker.execute {
                     return try await client.listPrompts()
                 }
                 prompts = promptsResult.prompts
-                logger.info("Loaded \(prompts.count) prompts from \(config.name)")
             } catch {
-                logger.debug("Prompts not supported by \(config.name): \(error)")
                 prompts = []
             }
-            
-            logger.info("Successfully loaded capabilities from \(config.name) - Tools: \(tools.count), Resources: \(resources.count), Prompts: \(prompts.count)")
         }
     }
     

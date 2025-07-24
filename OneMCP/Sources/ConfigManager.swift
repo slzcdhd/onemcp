@@ -7,10 +7,16 @@ class ConfigManager {
     let configFileURL: URL
     let mcpServersFileURL: URL
     
-    init() {
-        // Create config directory in Application Support
-        let appSupportURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        configDirectoryURL = appSupportURL.appendingPathComponent("OneMCP")
+    init(configDirectory: URL? = nil) {
+        if let customDirectory = configDirectory {
+            // Use custom directory for testing
+            configDirectoryURL = customDirectory
+        } else {
+            // Use default Application Support directory for production
+            let appSupportURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            configDirectoryURL = appSupportURL.appendingPathComponent("OneMCP")
+        }
+        
         configFileURL = configDirectoryURL.appendingPathComponent("config.json")
         mcpServersFileURL = configDirectoryURL.appendingPathComponent("mcp_servers.json")
         
@@ -190,9 +196,9 @@ class ConfigManager {
     }
     
     private func createServerConfig(name: String, config: [String: Any]) throws -> ServerConfig {
-        if let command = config["command"] as? String,
-           let args = config["args"] as? [String] {
+        if let command = config["command"] as? String {
             // Stdio server
+            let args = config["args"] as? [String] ?? []  // args is optional, default to empty array
             let environment = config["env"] as? [String: String] // Support both "env" and "environment"
             let workingDirectory = config["workingDirectory"] as? String
             

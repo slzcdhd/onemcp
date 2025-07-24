@@ -15,7 +15,6 @@ class HTTPServerTransport: @unchecked Sendable {
     private var server: MCP.Server?
     private weak var aggregationService: MCPAggregationService?
     private let maxConnections: Int = 100
-    private let performanceMonitor = PerformanceMonitor()
     
     init(host: String, port: Int, enableCORS: Bool = true, aggregationService: MCPAggregationService? = nil, logger: Logger) {
         self.host = host
@@ -48,7 +47,6 @@ class HTTPServerTransport: @unchecked Sendable {
             let serverStatus = ServerStartupStatus()
             
             listener?.stateUpdateHandler = { [weak self] state in
-                self?.logger.info("HTTP server state: \(state)")
                 switch state {
                 case .ready:
                     self?.logger.info("HTTP server listening on \(self?.host ?? "unknown"):\(self?.port ?? 0)")
@@ -57,7 +55,6 @@ class HTTPServerTransport: @unchecked Sendable {
                     self?.logger.error("HTTP server failed: \(error)")
                     serverStatus.complete(success: false, error: error, continuation: continuation)
                 case .cancelled:
-                    self?.logger.info("HTTP server cancelled")
                     serverStatus.complete(success: false, error: HTTPTransportError.serverCancelled, continuation: continuation)
                 default:
                     break
@@ -65,11 +62,6 @@ class HTTPServerTransport: @unchecked Sendable {
             }
             
             listener?.start(queue: .global(qos: .userInitiated))
-        }
-        
-        // Start performance monitoring task only after successful startup
-        Task {
-            await startPerformanceMonitoring()
         }
     }
     
@@ -81,23 +73,6 @@ class HTTPServerTransport: @unchecked Sendable {
             connection.close()
         }
         connections.removeAll()
-        
-        logger.info("HTTP server stopped")
-    }
-    
-    private func startPerformanceMonitoring() async {
-        while listener?.state != .cancelled {
-            try? await Task.sleep(for: .seconds(60)) // Log metrics every minute
-            
-            await performanceMonitor.logMetrics()
-            
-            // Check for performance alerts
-            let alerts = await performanceMonitor.checkAlerts()
-            for alert in alerts {
-                logger.log(level: alert.severity == .critical ? .critical : .warning, 
-                          "Performance Alert [\(alert.severity.displayName)]: \(alert.message)")
-            }
-        }
     }
     
     private func handleNewConnection(_ nwConnection: NWConnection) async {
@@ -117,18 +92,14 @@ class HTTPServerTransport: @unchecked Sendable {
         )
         
         connections.insert(connection)
-        await performanceMonitor.connectionOpened()
         
         nwConnection.stateUpdateHandler = { [weak self] state in
             if case .cancelled = state {
                 self?.connections.remove(connection)
-                Task {
-                    await self?.performanceMonitor.connectionClosed()
-                }
             }
         }
         
-        await connection.start(performanceMonitor: performanceMonitor)
+        await connection.start()
     }
 }
 
@@ -151,27 +122,26 @@ class HTTPConnection: Hashable, @unchecked Sendable {
         self.logger = logger
     }
     
-    func start(performanceMonitor: PerformanceMonitor? = nil) async {
+    func start() async {
         nwConnection.start(queue: .global(qos: .userInitiated))
-        await receiveData(performanceMonitor: performanceMonitor)
+        await receiveData()
     }
     
     func close() {
         nwConnection.cancel()
     }
     
-    private func receiveData(performanceMonitor: PerformanceMonitor? = nil) async {
+    private func receiveData() async {
         nwConnection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
             Task {
-                await self?.handleReceivedData(data, isComplete: isComplete, error: error, performanceMonitor: performanceMonitor)
+                await self?.handleReceivedData(data, isComplete: isComplete, error: error)
             }
         }
     }
     
-    private func handleReceivedData(_ data: Data?, isComplete: Bool, error: NWError?, performanceMonitor: PerformanceMonitor? = nil) async {
+    private func handleReceivedData(_ data: Data?, isComplete: Bool, error: NWError?) async {
         if let error = error {
             logger.error("Connection error: \(error)")
-            await performanceMonitor?.connectionError()
             return
         }
         
@@ -190,17 +160,13 @@ class HTTPConnection: Hashable, @unchecked Sendable {
             // Update buffer with remaining data
             buffer = remainingData
             
-            // Track request performance
-            let startTime = await performanceMonitor?.requestStarted() ?? Date()
-            
             // Handle the complete request
             await handleMCPRequest(request)
-            await performanceMonitor?.requestCompleted(startTime: startTime, success: true)
         }
         
         // Continue receiving data
         if !isComplete {
-            await receiveData(performanceMonitor: performanceMonitor)
+            await receiveData()
         }
     }
     
@@ -289,8 +255,6 @@ class HTTPConnection: Hashable, @unchecked Sendable {
         
         // Extract or create session ID  
         let sessionID = request.headers["mcp-session-id"] ?? UUID().uuidString
-        
-        logger.debug("Processing MCP POST request with session: \(sessionID)")
         
         // Check if this is a notification (no id field) or a request
         if jsonRequest["id"] != nil {
@@ -404,11 +368,8 @@ class HTTPConnection: Hashable, @unchecked Sendable {
     }
     
     private func handleListToolsRequest(_ jsonRequest: [String: Any]) async -> [String: Any] {
-        logger.info("Returning aggregated tools")
-        
         if let aggregationService = aggregationService {
-            let tools = await aggregationService.getAggregatedTools()
-            logger.info("Returning \(tools.count) aggregated tools")
+            let tools = await aggregationService.getTools()
             
             // Convert MCP.Tool to JSON-safe dictionary
             let toolsArray = tools.map { tool -> [String: Any] in
@@ -505,11 +466,8 @@ class HTTPConnection: Hashable, @unchecked Sendable {
     }
     
     private func handleListResourcesRequest(_ jsonRequest: [String: Any]) async -> [String: Any] {
-        logger.info("Returning aggregated resources")
-        
         if let aggregationService = aggregationService {
-            let resources = await aggregationService.getAggregatedResources()
-            logger.info("Returning \(resources.count) aggregated resources")
+            let resources = await aggregationService.getResources()
             
             // Convert MCP.Resource to JSON-safe dictionary
             let resourcesArray = resources.map { resource -> [String: Any] in
@@ -600,11 +558,8 @@ class HTTPConnection: Hashable, @unchecked Sendable {
     }
     
     private func handleListPromptsRequest(_ jsonRequest: [String: Any]) async -> [String: Any] {
-        logger.info("Returning aggregated prompts")
-        
         if let aggregationService = aggregationService {
-            let prompts = await aggregationService.getAggregatedPrompts()
-            logger.info("Returning \(prompts.count) aggregated prompts")
+            let prompts = await aggregationService.getPrompts()
             
             // Convert MCP.Prompt to JSON-safe dictionary
             let promptsArray = prompts.map { prompt -> [String: Any] in
@@ -731,11 +686,6 @@ class HTTPConnection: Hashable, @unchecked Sendable {
         // Extract client info from params
         let params = jsonRequest["params"] as? [String: Any] ?? [:]
         let protocolVersion = params["protocolVersion"] as? String ?? "2024-11-05"
-        let clientInfo = params["clientInfo"] as? [String: Any] ?? [:]
-        let clientName = clientInfo["name"] as? String ?? "unknown"
-        let clientVersion = clientInfo["version"] as? String ?? "1.0.0"
-        
-        logger.info("MCP initialize request from client: \(clientName) v\(clientVersion), protocol: \(protocolVersion)")
         
         return [
             "jsonrpc": "2.0",

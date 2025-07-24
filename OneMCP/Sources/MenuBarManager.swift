@@ -16,7 +16,7 @@ class MenuBarManager: ObservableObject {
         setupMenuBar()
         requestNotificationPermission()
         
-        // Schedule multiple delayed menu updates to catch server status changes after startup
+        // Schedule delayed menu updates to catch server status changes after startup
         Task {
             try? await Task.sleep(for: .seconds(5))
             await updateMenu()
@@ -32,22 +32,17 @@ class MenuBarManager: ObservableObject {
         if let menubarIconPath = Bundle.main.path(forResource: "menubar_icon_16", ofType: "png"),
            let icon = NSImage(contentsOfFile: menubarIconPath) {
             baseIcon = icon
-            print("[MenuBarManager] Loaded dedicated menubar icon (PNG)")
         } else if let menubarIconPath = Bundle.main.path(forResource: "MenuBarIcon", ofType: "icns"),
                   let icon = NSImage(contentsOfFile: menubarIconPath) {
             baseIcon = icon
-            print("[MenuBarManager] Loaded MenuBarIcon.icns for status bar")
         } else if let iconPath = Bundle.main.path(forResource: "OneMCP", ofType: "icns"),
                   let icon = NSImage(contentsOfFile: iconPath) {
             baseIcon = icon
-            print("[MenuBarManager] Using main app icon for status bar")
         } else if let bundleIcon = NSImage(named: "AppIcon") {
             baseIcon = bundleIcon
-            print("[MenuBarManager] Using AppIcon from bundle")
         } else {
             // Fallback to a simple custom icon created from the app name
             baseIcon = createFallbackIcon()
-            print("[MenuBarManager] Created fallback icon")
         }
     }
     
@@ -87,9 +82,6 @@ class MenuBarManager: ObservableObject {
     }
     
     private func setupMenuBar() {
-        // Force accessory mode for menu bar apps
-        NSApp.setActivationPolicy(.accessory)
-        
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem?.isVisible = true
         
@@ -97,9 +89,6 @@ class MenuBarManager: ObservableObject {
             // Use custom app icon
             updateStatusBarIcon()
             button.toolTip = "OneMCP - MCP Server Aggregator"
-            print("[MenuBarManager] Status bar icon created successfully with custom icon")
-        } else {
-            print("[MenuBarManager] ERROR: Failed to create status bar button")
         }
         
         updateMenuBarStatus()
@@ -471,15 +460,7 @@ class MenuBarManager: ObservableObject {
         }
         itemsToRemove.forEach { menu.removeItem($0) }
         
-        // Debug: print all server statuses
-        print("[MenuBarManager] AppState server statuses:")
-        for (index, status) in appState.serverStatuses.enumerated() {
-            print("  \(index): \(status.name) - \(status.status) - \(status.capabilities.total) capabilities")
-        }
-        
         let connectedServers = appState.serverStatuses.filter { $0.status == .connected }
-        
-        print("[MenuBarManager] Updating menu with \(connectedServers.count) connected servers from total \(appState.serverStatuses.count)")
         
         // Add servers section header
         if !connectedServers.isEmpty {
@@ -526,8 +507,6 @@ class MenuBarManager: ObservableObject {
         } else {
             // Add each connected server with enhanced styling
             for (index, server) in connectedServers.enumerated() {
-                print("[MenuBarManager] Adding server: \(server.name) with \(server.capabilities.total) capabilities")
-                
                 let serverItem = NSMenuItem(title: server.name, action: #selector(showServerDetails), keyEquivalent: "")
                 serverItem.representedObject = "server_item"
                 serverItem.tag = index
@@ -606,8 +585,6 @@ class MenuBarManager: ObservableObject {
     func updateMenu() async {
         guard statusItem?.menu != nil else { return }
         
-        print("[MenuBarManager] updateMenu called - server count: \(appState.serverStatuses.count)")
-        
         // Force recreate the menu to update server list
         await MainActor.run {
             createMenu()
@@ -616,15 +593,8 @@ class MenuBarManager: ObservableObject {
     }
     
     func forceMenuUpdate() {
-        print("[MenuBarManager] forceMenuUpdate called")
-        print("[MenuBarManager] Current server statuses: \(appState.serverStatuses.count)")
-        for (index, status) in appState.serverStatuses.enumerated() {
-            print("  \(index): \(status.name) - \(status.status) - \(status.capabilities.total) capabilities")
-        }
-        
         createMenu()
         updateMenuBarStatus()
-        print("[MenuBarManager] Force menu update completed")
     }
     
     // MARK: - Actions
@@ -632,10 +602,55 @@ class MenuBarManager: ObservableObject {
 
     
     @objc private func showMainWindow() {
-        if let window = NSApplication.shared.windows.first {
-            window.makeKeyAndOrderFront(nil)
+        // Get current activation policy and window info
+        let currentPolicy = NSApp.activationPolicy()
+        
+        // Temporarily change activation policy to regular to ensure window shows properly
+        if currentPolicy == .accessory {
+            NSApp.setActivationPolicy(.regular)
+        }
+        
+        // Activate the application first
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        
+        // Find the main application window (not status bar or popup windows)
+        let mainWindow = NSApplication.shared.windows.first { window in
+            let className = window.className
+            return !className.contains("StatusBar") && 
+                   !className.contains("PopupMenu") &&
+                   !className.contains("NSMenu") &&
+                   className.contains("NSWindow")
+        }
+        
+        if let window = mainWindow {
+            // Force window to be visible
+            window.setIsVisible(true)
+            window.deminiaturize(window)
+            window.makeKeyAndOrderFront(window)
             window.orderFrontRegardless()
-            NSApplication.shared.activate(ignoringOtherApps: true)
+            
+            // Ensure window is visible and focused
+            window.level = NSWindow.Level.normal
+            window.collectionBehavior = [NSWindow.CollectionBehavior.canJoinAllSpaces, NSWindow.CollectionBehavior.fullScreenAuxiliary]
+            
+        } else {
+            // No window exists, need to create one
+            // Use AppDelegate's createNewWindow method
+            if let appDelegate = NSApp.delegate as? AppDelegate {
+                appDelegate.createNewWindow()
+            } else {
+                // Fallback: Try to find and trigger new window action from main menu
+                if let mainMenu = NSApp.mainMenu {
+                    findAndTriggerNewWindowAction(in: mainMenu)
+                }
+            }
+        }
+        
+        // If we temporarily changed to regular, schedule a restore after the window is shown
+        if currentPolicy == .accessory && !appState.config.ui.showInDock {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { // Increased delay
+                NSApp.setActivationPolicy(.accessory)
+            }
         }
     }
     
@@ -668,20 +683,51 @@ class MenuBarManager: ObservableObject {
 
     
     @objc private func showPreferences() {
-        // Open main window and navigate to settings
+        // Try multiple approaches to show the window
         showMainWindow()
-        print("[MenuBarManager] Settings button clicked - opening main window")
+        
+        // Alternative approach: try to unhide the app
+        NSApplication.shared.unhide(nil)
+        
+        // Additional attempt: Use DispatchQueue to try again after a short delay
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            if let window = NSApplication.shared.windows.first {
+                if !window.isVisible {
+                    window.setIsVisible(true)
+                    window.makeKeyAndOrderFront(nil)
+                    window.center()
+                    NSApplication.shared.activate(ignoringOtherApps: true)
+                }
+            }
+        }
     }
     
     @objc private func quitApp() {
         NSApplication.shared.terminate(nil)
     }
     
+    private func findAndTriggerNewWindowAction(in menu: NSMenu) {
+        for item in menu.items {
+            // Check if this menu item can create a new window
+            if let title = item.title.lowercased() as String?, 
+               title.contains("new") && title.contains("window") &&
+               item.action != nil {
+                // Trigger the action using NSApp.sendAction
+                NSApp.sendAction(item.action!, to: item.target, from: item)
+                return
+            }
+            
+            // Recursively check submenus
+            if let submenu = item.submenu {
+                findAndTriggerNewWindowAction(in: submenu)
+            }
+        }
+    }
+    
     // MARK: - Notifications
     
     private func requestNotificationPermission() {
         // Temporarily disabled to prevent crashes - notifications will work without explicit permission request
-        print("Notification permission request skipped to prevent dispatch queue crashes")
         return
         
         /* 

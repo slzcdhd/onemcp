@@ -48,8 +48,6 @@ public actor LegacySSETransport: Transport {
     public func connect() async throws {
         guard !isConnected else { return }
         
-        logger.info("Connecting to legacy SSE endpoint: \(sseEndpoint)")
-        
         // Start SSE connection to get session and message endpoint
         sseTask = Task { await startSSEConnection() }
         
@@ -58,19 +56,13 @@ public actor LegacySSETransport: Transport {
         while sessionID == nil && attempts < 100 { // Increased attempts
             try await Task.sleep(for: .milliseconds(100))
             attempts += 1
-            
-            if attempts % 10 == 0 {
-                logger.debug("Waiting for session, attempt \(attempts)/100")
-            }
         }
         
-        guard let sessionID = sessionID, let _ = messageEndpoint else {
-            logger.error("Session ID: \(sessionID?.description ?? "nil"), Message endpoint: \(messageEndpoint?.description ?? "nil")")
+        guard sessionID != nil, messageEndpoint != nil else {
             throw MCPError.internalError("Failed to establish session with legacy SSE server after \(attempts) attempts")
         }
         
         isConnected = true
-        logger.info("Legacy SSE transport connected with session: \(sessionID)")
     }
     
     public func disconnect() async {
@@ -94,8 +86,6 @@ public actor LegacySSETransport: Transport {
         
         // Invalidate session
         session.invalidateAndCancel()
-        
-        logger.info("Legacy SSE transport disconnected")
     }
     
     public func send(_ data: Data) async throws {
@@ -107,8 +97,6 @@ public actor LegacySSETransport: Transport {
             throw MCPError.internalError("Message endpoint not available")
         }
         
-        logger.debug("Sending message to: \(messageEndpoint)")
-        
         var request = URLRequest(url: messageEndpoint)
         request.httpMethod = "POST"
         request.addValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -119,8 +107,6 @@ public actor LegacySSETransport: Transport {
         guard let httpResponse = response as? HTTPURLResponse else {
             throw MCPError.internalError("Invalid HTTP response")
         }
-        
-        logger.debug("Response status: \(httpResponse.statusCode)")
         
         guard 200..<300 ~= httpResponse.statusCode else {
             let responseText = String(data: responseData, encoding: .utf8) ?? "Unknown error"
@@ -136,9 +122,7 @@ public actor LegacySSETransport: Transport {
     }
     
     private func startSSEConnection() async {
-        logger.info("Starting SSE connection...")
         guard !isConnected || sessionID == nil else { 
-            logger.debug("SSE connection already established or session already available")
             return 
         }
         
@@ -146,8 +130,6 @@ public actor LegacySSETransport: Transport {
             logger.error("EventSource not supported on Linux")
             messageContinuation.yield(with: .failure(MCPError.internalError("EventSource not supported on Linux")))
         #else
-            logger.debug("Creating EventSource for: \(sseEndpoint)")
-            
             eventSource = EventSource(url: sseEndpoint)
             
             // Set up event handlers
@@ -162,30 +144,22 @@ public actor LegacySSETransport: Transport {
                     if let error = error {
                         self?.logger.error("EventSource error: \(error)")
                         self?.messageContinuation.yield(with: .failure(error))
-                    } else {
-                        self?.logger.warning("EventSource connection lost, will reconnect")
                     }
                 }
             }
             
-            eventSource!.onOpen = { [weak self] in
-                Task {
-                    self?.logger.debug("EventSource connection opened")
-                }
+            eventSource!.onOpen = {
+                // Connection opened - no logging needed
             }
             
             // EventSource starts automatically upon initialization
-            logger.debug("EventSource initialized and connecting...")
         #endif
     }
     
     private func handleSSEEvent(type: String?, data: String?) async {
         guard let eventType = type else { 
-            logger.debug("Received SSE event with no type")
             return 
         }
-        
-        logger.debug("Received SSE event: \(eventType) with data: \(data ?? "nil")")
         
         switch eventType {
         case "endpoint":
@@ -198,12 +172,12 @@ public actor LegacySSETransport: Transport {
             // This is an actual MCP message response
             if let data = data,
                let messageData = data.data(using: .utf8) {
-                logger.debug("Forwarding MCP message: \(data)")
                 messageContinuation.yield(messageData)
             }
             
         default:
-            logger.debug("Unknown SSE event type: \(eventType), data: \(data ?? "nil")")
+            // Unknown event type - ignore silently
+            break
         }
     }
     

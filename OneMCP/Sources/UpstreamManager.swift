@@ -1,15 +1,14 @@
 import Foundation
 import MCP
-import ServiceLifecycle
 import Logging
 
 protocol UpstreamManagerDelegate: AnyObject, Sendable {
-    func upstreamManagerDidUpdateServerStatus(_ status: ServerStatus) async
+    func upstreamManagerDidUpdateStatuses(_ statuses: [ServerStatus]) async
     func upstreamManagerDidUpdateCapabilities(_ capabilities: [AggregatedCapability]) async
     func upstreamManagerDidLogMessage(_ message: String, level: LogLevel) async
 }
 
-actor UpstreamManager: Service {
+actor UpstreamManager {
     weak var delegate: UpstreamManagerDelegate?
     
     private let logger = Logger(label: "com.onemcp.upstreammanager")
@@ -21,13 +20,7 @@ actor UpstreamManager: Service {
         self.delegate = delegate
     }
     
-    func run() async throws {
-        logger.info("Upstream manager started")
-    }
-    
-    func gracefulShutdown() async {
-        logger.info("Upstream manager shutting down")
-        
+    func shutdown() async {
         // Disconnect all clients
         for client in upstreamClients.values {
             await client.disconnect()
@@ -38,187 +31,271 @@ actor UpstreamManager: Service {
     }
     
     func connectToServers(_ serverConfigs: [ServerConfig]) async {
-        logger.info("connectToServers called with \(serverConfigs.count) configs, \(serverConfigs.filter(\.enabled).count) enabled")
-        
-        // Remove connections for servers that are no longer configured or disabled
-        let configuredIds = Set(serverConfigs.filter(\.enabled).map(\.id))
-        let currentIds = Set(upstreamClients.keys)
-        
-        let idsToRemove = currentIds.subtracting(configuredIds)
-        logger.info("Will disconnect \(idsToRemove.count) servers")
-        
-        for removedId in idsToRemove {
-            await disconnectServer(id: removedId)
-        }
-        
-        // Connect to new or updated servers
-        for config in serverConfigs.filter(\.enabled) {
-            if upstreamClients[config.id] == nil {
-                await connectServer(config: config)
+        // First, create or update status for all servers (including disabled ones)
+        for config in serverConfigs {
+            if serverStatuses[config.id] == nil {
+                // Create initial status for new servers
+                let status = ServerStatus(
+                    id: config.id,
+                    name: config.name,
+                    status: config.enabled ? .disconnected : .disconnected,
+                    lastError: nil,
+                    capabilities: CapabilityCount(tools: 0, resources: 0, prompts: 0)
+                )
+                serverStatuses[config.id] = status
             }
         }
         
+        // Remove connections for servers that are no longer configured
+        let configuredIds = Set(serverConfigs.map(\.id))
+        let currentIds = Set(upstreamClients.keys)
+        let statusIds = Set(serverStatuses.keys)
+        let idsToRemove = currentIds.subtracting(configuredIds)
+        let statusIdsToRemove = statusIds.subtracting(configuredIds)
+        
+        for id in idsToRemove {
+            if let client = upstreamClients[id] {
+                await client.disconnect()
+                upstreamClients.removeValue(forKey: id)
+            }
+        }
+        
+        // Remove status for servers that are no longer configured
+        for id in statusIdsToRemove {
+            serverStatuses.removeValue(forKey: id)
+        }
+        
+        // Connect to enabled servers only
+        let enabledIds = Set(serverConfigs.filter(\.enabled).map(\.id))
+        let disabledIds = configuredIds.subtracting(enabledIds)
+        
+        // Disconnect disabled servers
+        for id in disabledIds {
+            if let client = upstreamClients[id] {
+                await client.disconnect()
+                upstreamClients.removeValue(forKey: id)
+                // Update status to disconnected
+                if var status = serverStatuses[id] {
+                    status.status = .disconnected
+                    status.lastError = nil
+                    serverStatuses[id] = status
+                }
+            }
+        }
+        
+        // Connect to enabled servers
+        for config in serverConfigs where config.enabled {
+            if upstreamClients[config.id] == nil {
+                await connectSpecificServer(config)
+            }
+        }
+        
+        // Notify delegate of all status updates
+        await delegate?.upstreamManagerDidUpdateStatuses(Array(serverStatuses.values))
+        
+        // Update aggregated capabilities
         await updateAggregatedCapabilities()
     }
     
     func connectSpecificServer(_ serverConfig: ServerConfig) async {
-        guard serverConfig.enabled else {
-            logger.info("Server \(serverConfig.name) is disabled, not connecting")
-            return
-        }
+        let clientLogger = Logger(label: "com.onemcp.upstreamclient.\(serverConfig.name)")
+        let client = UpstreamClient(config: serverConfig, logger: clientLogger)
         
-        // If server is already connected, disconnect first
-        if upstreamClients[serverConfig.id] != nil {
-            logger.info("Server \(serverConfig.name) already connected, reconnecting...")
-            await disconnectSpecificServer(id: serverConfig.id)
-        }
-        
-        await connectServer(config: serverConfig)
-        await updateAggregatedCapabilities()
-    }
-    
-    func disconnectSpecificServer(id: UUID) async {
-        await disconnectServer(id: id)
-        await updateAggregatedCapabilities()
-    }
-    
-    private func connectServer(config: ServerConfig) async {
-        logger.info("Connecting to server: \(config.name)")
+        upstreamClients[serverConfig.id] = client
         
         // Update status to connecting
-        let status = ServerStatus(id: config.id, name: config.name, status: .connecting)
-        serverStatuses[config.id] = status
-        await notifyStatusUpdate(status)
+        let status = ServerStatus(
+            id: serverConfig.id,
+            name: serverConfig.name,
+            status: .connecting,
+            lastError: nil,
+            capabilities: CapabilityCount(tools: 0, resources: 0, prompts: 0)
+        )
+        serverStatuses[serverConfig.id] = status
+        await delegate?.upstreamManagerDidUpdateStatuses(Array(serverStatuses.values))
         
+        // Connect to the server
         do {
-            let client = UpstreamClient(config: config, logger: logger)
-            upstreamClients[config.id] = client
-            
             try await client.connect()
-            
-            // Wait a moment for capabilities to load if possible
-            try? await Task.sleep(for: .milliseconds(500))
             
             // Update status to connected
             let connectedStatus = ServerStatus(
-                id: config.id,
-                name: config.name,
+                id: serverConfig.id,
+                name: serverConfig.name,
                 status: .connected,
-                lastConnected: Date(),
-                capabilities: await client.getCapabilityCount()
+                lastError: nil,
+                capabilities: CapabilityCount(
+                    tools: await client.getTools().count,
+                    resources: await client.getResources().count,
+                    prompts: await client.getPrompts().count
+                )
             )
-            serverStatuses[config.id] = connectedStatus
-            await notifyStatusUpdate(connectedStatus)
+            serverStatuses[serverConfig.id] = connectedStatus
+            await delegate?.upstreamManagerDidUpdateStatuses(Array(serverStatuses.values))
             
-            logger.info("Successfully connected to server: \(config.name) with capabilities: tools=\(connectedStatus.capabilities.tools), resources=\(connectedStatus.capabilities.resources), prompts=\(connectedStatus.capabilities.prompts)")
-            await logMessage("Successfully connected to server: \(config.name)", level: .info)
+            // Update aggregated capabilities
+            await updateAggregatedCapabilities()
             
         } catch {
-            logger.error("Failed to connect to server \(config.name): \(error)")
-            
             // Update status to error
             let errorStatus = ServerStatus(
-                id: config.id,
-                name: config.name,
+                id: serverConfig.id,
+                name: serverConfig.name,
                 status: .error,
-                lastError: error.localizedDescription
+                lastError: error.localizedDescription,
+                capabilities: CapabilityCount(tools: 0, resources: 0, prompts: 0)
             )
-            serverStatuses[config.id] = errorStatus
-            await notifyStatusUpdate(errorStatus)
+            serverStatuses[serverConfig.id] = errorStatus
+            await delegate?.upstreamManagerDidUpdateStatuses(Array(serverStatuses.values))
             
-            await logMessage("Failed to connect to server: \(config.name) - \(error.localizedDescription)", level: .error)
+            // Log error
+            logger.error("Failed to connect to \(serverConfig.name): \(error)")
+            await delegate?.upstreamManagerDidLogMessage("Failed to connect to \(serverConfig.name): \(error.localizedDescription)", level: .error)
         }
     }
     
-    private func disconnectServer(id: UUID) async {
-        guard let client = upstreamClients[id] else { return }
-        
-        logger.info("Disconnecting server with id: \(id)")
-        
-        await client.disconnect()
-        upstreamClients.removeValue(forKey: id)
-        
-        if let status = serverStatuses[id] {
-            let disconnectedStatus = ServerStatus(
-                id: status.id,
-                name: status.name,
-                status: .disconnected
-            )
-            serverStatuses[id] = disconnectedStatus
-            logger.info("Server \(status.name) disconnected, notifying status update")
-            await notifyStatusUpdate(disconnectedStatus)
+    func disconnectSpecificServer(id: UUID) async {
+        if let client = upstreamClients[id] {
+            await client.disconnect()
+            upstreamClients.removeValue(forKey: id)
+            serverStatuses.removeValue(forKey: id)
+            await delegate?.upstreamManagerDidUpdateStatuses(Array(serverStatuses.values))
+            await updateAggregatedCapabilities()
         }
     }
     
     private func updateAggregatedCapabilities() async {
-        var capabilities: [AggregatedCapability] = []
+        var toolsByName: [String: AggregatedCapability] = [:]
+        var resourcesByUri: [String: AggregatedCapability] = [:]
+        var promptsByName: [String: AggregatedCapability] = [:]
         
-        for (id, client) in upstreamClients {
-            guard let status = serverStatuses[id] else { continue }
+        for (serverId, client) in upstreamClients {
+            guard let serverName = serverStatuses[serverId]?.name else { continue }
             
-            let clientCapabilities = await client.getAggregatedCapabilities(serverName: status.name)
-            capabilities.append(contentsOf: clientCapabilities)
+            // Aggregate tools
+            let tools = await client.getTools()
+            for tool in tools {
+                let prefixedName = "\(serverName):\(tool.name)"
+                toolsByName[prefixedName] = AggregatedCapability(
+                    originalName: tool.name,
+                    prefixedName: prefixedName,
+                    serverId: serverId,
+                    serverName: serverName,
+                    type: .tool,
+                    description: tool.description
+                )
+            }
+            
+            // Aggregate resources
+            let resources = await client.getResources()
+            for resource in resources {
+                let prefixedUri = "\(serverName):\(resource.uri)"
+                resourcesByUri[prefixedUri] = AggregatedCapability(
+                    originalName: resource.uri,
+                    prefixedName: prefixedUri,
+                    serverId: serverId,
+                    serverName: serverName,
+                    type: .resource,
+                    description: resource.description
+                )
+            }
+            
+            // Aggregate prompts
+            let prompts = await client.getPrompts()
+            for prompt in prompts {
+                let prefixedName = "\(serverName):\(prompt.name)"
+                promptsByName[prefixedName] = AggregatedCapability(
+                    originalName: prompt.name,
+                    prefixedName: prefixedName,
+                    serverId: serverId,
+                    serverName: serverName,
+                    type: .prompt,
+                    description: prompt.description
+                )
+            }
         }
         
-        aggregatedCapabilities = capabilities
-        await notifyCapabilitiesUpdate(capabilities)
+        aggregatedCapabilities = Array(toolsByName.values) + 
+                               Array(resourcesByUri.values) + 
+                               Array(promptsByName.values)
+        
+        await delegate?.upstreamManagerDidUpdateCapabilities(aggregatedCapabilities)
     }
     
-    // MARK: - MCP Method Implementations
+    // MARK: - Capability Access
     
     func getAggregatedTools() async -> [MCP.Tool] {
         var tools: [MCP.Tool] = []
         
-        for (id, client) in upstreamClients {
-            guard let status = serverStatuses[id], status.status == .connected else { continue }
+        for (serverId, client) in upstreamClients {
+            guard let serverName = serverStatuses[serverId]?.name else { continue }
             
             let clientTools = await client.getTools()
             for tool in clientTools {
-                let prefixedTool = MCP.Tool(
-                    name: "\(status.name)___\(tool.name)",
+                let prefixedName = "\(serverName):\(tool.name)"
+                let modifiedTool = MCP.Tool(
+                    name: prefixedName,
                     description: tool.description,
                     inputSchema: tool.inputSchema
                 )
-                tools.append(prefixedTool)
+                tools.append(modifiedTool)
             }
         }
         
         return tools
     }
     
-    func callTool(name: String, arguments: [String: Any]?) async throws -> (content: [MCP.Tool.Content], isError: Bool) {
-        let (serverName, toolName) = parsePrefix(name)
-        
-        guard let serverId = serverStatuses.first(where: { $0.value.name == serverName })?.key,
-              let client = upstreamClients[serverId] else {
-            throw MCPError.invalidRequest("Server not found: \(serverName)")
-        }
-        
-        let mcpArgs = MCPArguments(arguments)
-        let result = try await client.callTool(name: toolName, arguments: mcpArgs.toAnyDict())
-        
-        return (content: result.content, isError: result.isError ?? false)
-    }
-    
     func getAggregatedResources() async -> [MCP.Resource] {
         var resources: [MCP.Resource] = []
         
-        for (id, client) in upstreamClients {
-            guard let status = serverStatuses[id], status.status == .connected else { continue }
+        for (serverId, client) in upstreamClients {
+            guard let serverName = serverStatuses[serverId]?.name else { continue }
             
             let clientResources = await client.getResources()
             for resource in clientResources {
-                let prefixedResource = MCP.Resource(
-                    name: resource.name,
-                    uri: "\(status.name)://\(resource.uri)",
-                    description: resource.description,
-                    mimeType: resource.mimeType
-                )
-                resources.append(prefixedResource)
+                var modifiedResource = resource
+                modifiedResource.uri = "\(serverName):\(resource.uri)"
+                resources.append(modifiedResource)
             }
         }
         
         return resources
+    }
+    
+    func getAggregatedPrompts() async -> [MCP.Prompt] {
+        var prompts: [MCP.Prompt] = []
+        
+        for (serverId, client) in upstreamClients {
+            guard let serverName = serverStatuses[serverId]?.name else { continue }
+            
+            let clientPrompts = await client.getPrompts()
+            for prompt in clientPrompts {
+                let prefixedName = "\(serverName):\(prompt.name)"
+                let modifiedPrompt = MCP.Prompt(
+                    name: prefixedName,
+                    description: prompt.description,
+                    arguments: prompt.arguments
+                )
+                prompts.append(modifiedPrompt)
+            }
+        }
+        
+        return prompts
+    }
+    
+    // MARK: - Method Calls
+    
+    func callTool(name: String, arguments: [String: Any]?) async throws -> (content: [MCP.Tool.Content], isError: Bool?) {
+        let (serverName, toolName) = parsePrefix(name)
+        
+        guard let serverId = serverStatuses.first(where: { $0.value.name == serverName })?.key,
+              let client = upstreamClients[serverId] else {
+            throw MCPError.invalidRequest("Tool not found: \(name)")
+        }
+        
+        // Use MCPArguments wrapper for thread-safe argument passing
+        let mcpArgs = MCPArguments(arguments)
+        return try await client.callTool(name: toolName, arguments: mcpArgs.toAnyDict())
     }
     
     func readResource(uri: String) async throws -> [MCP.Resource.Content] {
@@ -226,88 +303,41 @@ actor UpstreamManager: Service {
         
         guard let serverId = serverStatuses.first(where: { $0.value.name == serverName })?.key,
               let client = upstreamClients[serverId] else {
-            throw MCPError.invalidRequest("Server not found: \(serverName)")
+            throw MCPError.invalidRequest("Resource not found: \(uri)")
         }
         
-        let result = try await client.readResource(uri: resourceUri)
-        return result
+        return try await client.readResource(uri: resourceUri)
     }
     
-    func getAggregatedPrompts() async -> [MCP.Prompt] {
-        var prompts: [MCP.Prompt] = []
-        
-        for (id, client) in upstreamClients {
-            guard let status = serverStatuses[id], status.status == .connected else { continue }
-            
-            let clientPrompts = await client.getPrompts()
-            for prompt in clientPrompts {
-                let prefixedPrompt = MCP.Prompt(
-                    name: "\(status.name)___\(prompt.name)",
-                    description: prompt.description,
-                    arguments: prompt.arguments
-                )
-                prompts.append(prefixedPrompt)
-            }
-        }
-        
-        return prompts
-    }
-    
-    func getPrompt(name: String, arguments: [String: Any]?) async throws -> MCP.GetPrompt.Result? {
+    func getPrompt(name: String, arguments: [String: Any]?) async throws -> MCP.GetPrompt.Result {
         let (serverName, promptName) = parsePrefix(name)
         
         guard let serverId = serverStatuses.first(where: { $0.value.name == serverName })?.key,
               let client = upstreamClients[serverId] else {
-            throw MCPError.invalidRequest("Server not found: \(serverName)")
+            throw MCPError.invalidRequest("Prompt not found: \(name)")
         }
         
+        // Use MCPArguments wrapper for thread-safe argument passing
         let mcpArgs = MCPArguments(arguments)
         let result = try await client.getPrompt(name: promptName, arguments: mcpArgs.toAnyDict())
-        
-        // Convert to MCP.GetPrompt.Result
-        return MCP.GetPrompt.Result(
-            description: result.description,
-            messages: result.messages
-        )
+        return MCP.GetPrompt.Result(description: result.description, messages: result.messages)
     }
     
     // MARK: - Helper Methods
     
     private func parsePrefix(_ name: String) -> (serverName: String, itemName: String) {
-        let components = name.components(separatedBy: "___")
-        if components.count >= 2 {
-            let serverName = components[0]
-            let itemName = components[1...].joined(separator: "___")
-            return (serverName, itemName)
+        let components = name.split(separator: ":", maxSplits: 1)
+        if components.count == 2 {
+            return (String(components[0]), String(components[1]))
         }
         return ("", name)
     }
     
     private func parseResourcePrefix(_ uri: String) -> (serverName: String, resourceUri: String) {
-        if let colonIndex = uri.firstIndex(of: ":"),
-           let slashIndex = uri.range(of: "://") {
-            let serverName = String(uri[..<colonIndex])
-            let resourceUri = String(uri[slashIndex.upperBound...])
-            return (serverName, resourceUri)
+        let components = uri.split(separator: ":", maxSplits: 1)
+        if components.count == 2 {
+            return (String(components[0]), String(components[1]))
         }
         return ("", uri)
     }
-    
-    private func notifyStatusUpdate(_ status: ServerStatus) async {
-        if let currentDelegate = delegate {
-            await currentDelegate.upstreamManagerDidUpdateServerStatus(status)
-        }
-    }
-    
-    private func notifyCapabilitiesUpdate(_ capabilities: [AggregatedCapability]) async {
-        if let currentDelegate = delegate {
-            await currentDelegate.upstreamManagerDidUpdateCapabilities(capabilities)
-        }
-    }
-    
-    private func logMessage(_ message: String, level: LogLevel) async {
-        if let currentDelegate = delegate {
-            await currentDelegate.upstreamManagerDidLogMessage(message, level: level)
-        }
-    }
-}
+} 

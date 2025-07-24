@@ -1,5 +1,4 @@
 import SwiftUI
-import ServiceLifecycle
 import Logging
 
 @main
@@ -17,7 +16,7 @@ struct OneMCPApp: App {
     }
     
     var body: some Scene {
-        WindowGroup {
+        WindowGroup("OneMCP") {
             ContentView()
                 .environmentObject(appState)
                 .onAppear {
@@ -35,13 +34,6 @@ struct OneMCPApp: App {
                 Button("About OneMCP") {
                     showAboutPanel()
                 }
-            }
-            
-            CommandGroup(after: .appInfo) {
-                Button("Check for Updates...") {
-                    // TODO: Implement update checking
-                }
-                .disabled(true)
             }
         }
         
