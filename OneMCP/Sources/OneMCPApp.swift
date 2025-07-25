@@ -34,10 +34,13 @@ struct OneMCPApp: App {
                     }
                 }
                 .onReceive(NotificationCenter.default.publisher(for: .showMainWindow)) { _ in
+                    print("[OneMCPApp] Received showMainWindow notification")
                     // Handle request to show main window
                     if #available(macOS 13.0, *) {
+                        print("[OneMCPApp] Using openWindow API")
                         openWindow(id: "main")
                     } else {
+                        print("[OneMCPApp] Using legacy window handling")
                         // For older macOS, ensure window is visible
                         DispatchQueue.main.async {
                             if let window = NSApplication.shared.windows.first(where: { window in
@@ -46,9 +49,12 @@ struct OneMCPApp: App {
                                        !className.contains("PopupMenu") &&
                                        !className.contains("NSMenu")
                             }) {
+                                print("[OneMCPApp] Found window to show: \(window.className)")
                                 window.setIsVisible(true)
                                 window.makeKeyAndOrderFront(nil)
                                 NSApp.activate(ignoringOtherApps: true)
+                            } else {
+                                print("[OneMCPApp] No window found in legacy handler")
                             }
                         }
                     }

@@ -602,10 +602,13 @@ class MenuBarManager: ObservableObject {
 
     
     @objc private func showMainWindow() {
+        print("[MenuBarManager] showMainWindow called")
         // Use AppDelegate's showMainWindow method which has more robust window creation logic
         if let appDelegate = NSApp.delegate as? AppDelegate {
+            print("[MenuBarManager] Calling AppDelegate.showMainWindow")
             appDelegate.showMainWindow()
         } else {
+            print("[MenuBarManager] AppDelegate not found, using fallback")
             // Fallback to previous implementation if AppDelegate is not available
             showMainWindowFallback()
         }
