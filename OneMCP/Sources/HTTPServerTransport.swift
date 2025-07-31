@@ -12,6 +12,7 @@ class HTTPServerTransport: @unchecked Sendable {
     
     private var listener: NWListener?
     private var connections: Set<HTTPConnection> = []
+    private let connectionsQueue = DispatchQueue(label: "HTTPServerTransport.connections", attributes: .concurrent)
     private var server: MCP.Server?
     private weak var aggregationService: MCPAggregationService?
     private let maxConnections: Int = 100
@@ -68,16 +69,41 @@ class HTTPServerTransport: @unchecked Sendable {
     func stop() async {
         listener?.cancel()
         
-        // Close all connections
-        for connection in connections {
-            connection.close()
+        // Close all connections with thread safety
+        let connectionsToClose: [HTTPConnection] = await withCheckedContinuation { continuation in
+            connectionsQueue.async(flags: .barrier) { [weak self] in
+                guard let self = self else {
+                    continuation.resume(returning: [])
+                    return
+                }
+                let connectionsToClose = Array(self.connections)
+                self.connections.removeAll()
+                continuation.resume(returning: connectionsToClose)
+            }
         }
-        connections.removeAll()
+        
+        await withTaskGroup(of: Void.self) { group in
+            for connection in connectionsToClose {
+                group.addTask {
+                    await (connection as HTTPConnection).close()
+                }
+            }
+        }
     }
     
     private func handleNewConnection(_ nwConnection: NWConnection) async {
-        // Check connection limit
-        if connections.count >= maxConnections {
+        // Check connection limit with thread safety
+        let shouldReject: Bool = await withCheckedContinuation { continuation in
+            connectionsQueue.async { [weak self] in
+                guard let self = self else {
+                    continuation.resume(returning: true)
+                    return
+                }
+                continuation.resume(returning: self.connections.count >= self.maxConnections)
+            }
+        }
+        
+        if shouldReject {
             logger.warning("Maximum connections reached (\(maxConnections)), rejecting new connection")
             nwConnection.cancel()
             return
@@ -91,15 +117,28 @@ class HTTPServerTransport: @unchecked Sendable {
             logger: logger
         )
         
-        connections.insert(connection)
-        
+        // Set up state handler before inserting to avoid race conditions
         nwConnection.stateUpdateHandler = { [weak self] state in
             if case .cancelled = state {
-                self?.connections.remove(connection)
+                self?.removeConnection(connection)
+            }
+        }
+        
+        // Add connection with thread safety
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            connectionsQueue.async(flags: .barrier) { [weak self] in
+                self?.connections.insert(connection)
+                continuation.resume()
             }
         }
         
         await connection.start()
+    }
+    
+    private func removeConnection(_ connection: HTTPConnection) {
+        connectionsQueue.async(flags: .barrier) { [weak self] in
+            self?.connections.remove(connection)
+        }
     }
 }
 
@@ -113,6 +152,9 @@ class HTTPConnection: Hashable, @unchecked Sendable {
     private let logger: Logger
     private let id = UUID()
     private var buffer = Data()
+    private let bufferQueue = DispatchQueue(label: "HTTPConnection.buffer")
+    private var isClosed = false
+    private let closeQueue = DispatchQueue(label: "HTTPConnection.close")
     
     init(nwConnection: NWConnection, server: MCP.Server?, aggregationService: MCPAggregationService?, enableCORS: Bool, logger: Logger) {
         self.nwConnection = nwConnection
@@ -127,11 +169,36 @@ class HTTPConnection: Hashable, @unchecked Sendable {
         await receiveData()
     }
     
-    func close() {
-        nwConnection.cancel()
+    func close() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            closeQueue.async { [weak self] in
+                guard let self = self else {
+                    continuation.resume()
+                    return
+                }
+                
+                guard !self.isClosed else {
+                    continuation.resume()
+                    return
+                }
+                
+                self.isClosed = true
+                self.nwConnection.cancel()
+                continuation.resume()
+            }
+        }
     }
     
     private func receiveData() async {
+        // Check if connection is already closed
+        let shouldContinue: Bool = await withCheckedContinuation { continuation in
+            closeQueue.async { [weak self] in
+                continuation.resume(returning: self?.isClosed == false)
+            }
+        }
+        
+        guard shouldContinue else { return }
+        
         nwConnection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
             Task {
                 await self?.handleReceivedData(data, isComplete: isComplete, error: error)
@@ -147,26 +214,49 @@ class HTTPConnection: Hashable, @unchecked Sendable {
         
         guard let data = data, !data.isEmpty else {
             if isComplete {
-                close()
+                await close()
             }
             return
         }
         
-        // Append to buffer
-        buffer.append(data)
+        // Process buffer with thread safety
+        let parseResult: (HTTPRequest, Data)? = await withCheckedContinuation { continuation in
+            bufferQueue.async { [weak self] in
+                guard let self = self else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                
+                // Append to buffer
+                self.buffer.append(data)
+                
+                // Try to parse HTTP request from buffer
+                let parseResult = self.parseCompleteHTTPRequest(from: self.buffer)
+                if let (_, remainingData) = parseResult {
+                    // Update buffer with remaining data
+                    self.buffer = remainingData
+                }
+                
+                continuation.resume(returning: parseResult)
+            }
+        }
         
-        // Try to parse HTTP request from buffer
-        if let (request, remainingData) = parseCompleteHTTPRequest(from: buffer) {
-            // Update buffer with remaining data
-            buffer = remainingData
-            
-            // Handle the complete request
+        // Handle the complete request
+        if let (request, _) = parseResult {
             await handleMCPRequest(request)
         }
         
-        // Continue receiving data
+        // Continue receiving data if connection is still open
         if !isComplete {
-            await receiveData()
+            let shouldContinue: Bool = await withCheckedContinuation { continuation in
+                closeQueue.async { [weak self] in
+                    continuation.resume(returning: self?.isClosed == false)
+                }
+            }
+            
+            if shouldContinue {
+                await receiveData()
+            }
         }
     }
     
@@ -424,14 +514,40 @@ class HTTPConnection: Hashable, @unchecked Sendable {
             do {
                 let result = try await aggregationService.callTool(name: toolName, arguments: arguments)
                 
-                // Convert MCP.Tool.Content to JSON - simplified for now
+                // Convert MCP.Tool.Content to JSON
                 let contentArray = result.content.map { content -> [String: Any] in
                     switch content {
                     case .text(let text):
-                        return ["type": "text", "text": text]
-                    default:
-                        // For now, convert all other types to text representation
-                        return ["type": "text", "text": String(describing: content)]
+                        return [
+                            "type": "text",
+                            "text": text
+                        ]
+                    case .image(let data, let mimeType, let metadata):
+                        var imageContent: [String: Any] = [
+                            "type": "image",
+                            "data": data,
+                            "mimeType": mimeType
+                        ]
+                        if let metadata = metadata {
+                            imageContent["metadata"] = metadata
+                        }
+                        return imageContent
+                    case .audio(let data, let mimeType):
+                        return [
+                            "type": "audio",
+                            "data": data,
+                            "mimeType": mimeType
+                        ]
+                    case .resource(let uri, let mimeType, let text):
+                        var resourceContent: [String: Any] = [
+                            "type": "resource",
+                            "uri": uri,
+                            "mimeType": mimeType
+                        ]
+                        if let text = text {
+                            resourceContent["text"] = text
+                        }
+                        return resourceContent
                     }
                 }
                 
@@ -524,8 +640,23 @@ class HTTPConnection: Hashable, @unchecked Sendable {
                 
                 // Convert MCP.Resource.Content to JSON
                 let contentsArray = contents.map { content -> [String: Any] in
-                    // For now, convert all content to text representation
-                    return ["type": "text", "text": String(describing: content)]
+                    var contentDict: [String: Any] = [
+                        "uri": content.uri
+                    ]
+                    
+                    if let mimeType = content.mimeType {
+                        contentDict["mimeType"] = mimeType
+                    }
+                    
+                    if let text = content.text {
+                        contentDict["text"] = text
+                    }
+                    
+                    if let blob = content.blob {
+                        contentDict["blob"] = blob
+                    }
+                    
+                    return contentDict
                 }
                 
                 return [
@@ -638,8 +769,39 @@ class HTTPConnection: Hashable, @unchecked Sendable {
                             "role": message.role.rawValue
                         ]
                         
-                        // Convert message content to simple text representation for now
-                        messageDict["content"] = String(describing: message.content)
+                        // Convert message content based on its type
+                        switch message.content {
+                        case .text(let text):
+                            messageDict["content"] = [
+                                "type": "text",
+                                "text": text
+                            ]
+                        case .image(let data, let mimeType):
+                            messageDict["content"] = [
+                                "type": "image",
+                                "data": data,
+                                "mimeType": mimeType
+                            ]
+                        case .audio(let data, let mimeType):
+                            messageDict["content"] = [
+                                "type": "audio",
+                                "data": data,
+                                "mimeType": mimeType
+                            ]
+                        case .resource(let uri, let mimeType, let text, let blob):
+                            var resourceContent: [String: Any] = [
+                                "type": "resource",
+                                "uri": uri,
+                                "mimeType": mimeType
+                            ]
+                            if let text = text {
+                                resourceContent["text"] = text
+                            }
+                            if let blob = blob {
+                                resourceContent["blob"] = blob
+                            }
+                            messageDict["content"] = resourceContent
+                        }
                         
                         return messageDict
                     }
@@ -705,7 +867,7 @@ class HTTPConnection: Hashable, @unchecked Sendable {
                     "name": "OneMCP Aggregation Server",
                     "version": "1.0.0"
                 ],
-                "instructions": "This server aggregates capabilities from multiple upstream MCP servers. Tool names are prefixed with server names (e.g., 'playwright___browser_close')."
+                "instructions": "This server aggregates capabilities from multiple upstream MCP servers. Tool names are prefixed with server names using triple underscores (e.g., 'playwright___browser_close')."
             ]
         ]
     }
@@ -816,7 +978,9 @@ class HTTPConnection: Hashable, @unchecked Sendable {
                 self?.logger.error("Failed to send response: \(error)")
             } else {
                 // Close connection after sending response for HTTP/1.1 with Connection: close
-                self?.close()
+                Task {
+                    await self?.close()
+                }
             }
         })
     }

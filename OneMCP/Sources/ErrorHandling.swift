@@ -12,6 +12,7 @@ enum OneMCPError: LocalizedError, Sendable {
     case mcpProtocolError(String)
     case systemError(String)
     case validationError(String)
+    case sessionInvalidated(String)  // New error type for session invalidation
     
     var errorDescription: String? {
         switch self {
@@ -27,6 +28,8 @@ enum OneMCPError: LocalizedError, Sendable {
             return "System Error: \(message)"
         case .validationError(let message):
             return "Validation Error: \(message)"
+        case .sessionInvalidated(let message):
+            return "Session Invalidated: \(message)"
         }
     }
     
@@ -44,6 +47,8 @@ enum OneMCPError: LocalizedError, Sendable {
             return "Check system resources and permissions."
         case .validationError:
             return "Review the input data and correct any invalid values."
+        case .sessionInvalidated:
+            return "The session will be automatically reestablished. If the problem persists, check if the upstream server is running."
         }
     }
     
@@ -51,8 +56,8 @@ enum OneMCPError: LocalizedError, Sendable {
         switch self {
         case .configurationError, .validationError:
             return .warning
-        case .networkError:
-            return .moderate
+        case .networkError, .sessionInvalidated:
+            return .moderate  // Session invalidation is recoverable
         case .serviceError, .mcpProtocolError, .systemError:
             return .critical
         }

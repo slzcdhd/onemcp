@@ -175,7 +175,7 @@ actor UpstreamManager {
             // Aggregate tools
             let tools = await client.getTools()
             for tool in tools {
-                let prefixedName = "\(serverName):\(tool.name)"
+                let prefixedName = "\(serverName)___\(tool.name)"
                 toolsByName[prefixedName] = AggregatedCapability(
                     originalName: tool.name,
                     prefixedName: prefixedName,
@@ -189,7 +189,7 @@ actor UpstreamManager {
             // Aggregate resources
             let resources = await client.getResources()
             for resource in resources {
-                let prefixedUri = "\(serverName):\(resource.uri)"
+                let prefixedUri = "\(serverName)___\(resource.uri)"
                 resourcesByUri[prefixedUri] = AggregatedCapability(
                     originalName: resource.uri,
                     prefixedName: prefixedUri,
@@ -203,7 +203,7 @@ actor UpstreamManager {
             // Aggregate prompts
             let prompts = await client.getPrompts()
             for prompt in prompts {
-                let prefixedName = "\(serverName):\(prompt.name)"
+                let prefixedName = "\(serverName)___\(prompt.name)"
                 promptsByName[prefixedName] = AggregatedCapability(
                     originalName: prompt.name,
                     prefixedName: prefixedName,
@@ -232,7 +232,7 @@ actor UpstreamManager {
             
             let clientTools = await client.getTools()
             for tool in clientTools {
-                let prefixedName = "\(serverName):\(tool.name)"
+                let prefixedName = "\(serverName)___\(tool.name)"
                 let modifiedTool = MCP.Tool(
                     name: prefixedName,
                     description: tool.description,
@@ -254,7 +254,7 @@ actor UpstreamManager {
             let clientResources = await client.getResources()
             for resource in clientResources {
                 var modifiedResource = resource
-                modifiedResource.uri = "\(serverName):\(resource.uri)"
+                modifiedResource.uri = "\(serverName)___\(resource.uri)"
                 resources.append(modifiedResource)
             }
         }
@@ -270,7 +270,7 @@ actor UpstreamManager {
             
             let clientPrompts = await client.getPrompts()
             for prompt in clientPrompts {
-                let prefixedName = "\(serverName):\(prompt.name)"
+                let prefixedName = "\(serverName)___\(prompt.name)"
                 let modifiedPrompt = MCP.Prompt(
                     name: prefixedName,
                     description: prompt.description,
@@ -293,9 +293,16 @@ actor UpstreamManager {
             throw MCPError.invalidRequest("Tool not found: \(name)")
         }
         
-        // Use MCPArguments wrapper for thread-safe argument passing
-        let mcpArgs = MCPArguments(arguments)
-        return try await client.callTool(name: toolName, arguments: mcpArgs.toAnyDict())
+        do {
+            // Use MCPArguments wrapper for thread-safe argument passing
+            let mcpArgs = MCPArguments(arguments)
+            return try await client.callTool(name: toolName, arguments: mcpArgs.toAnyDict())
+        } catch {
+            // Log the error for debugging
+            logger.error("Tool call failed for \(serverName): \(error)")
+            await delegate?.upstreamManagerDidLogMessage("Tool call failed for \(serverName): \(error.localizedDescription)", level: .error)
+            throw error
+        }
     }
     
     func readResource(uri: String) async throws -> [MCP.Resource.Content] {
@@ -306,7 +313,14 @@ actor UpstreamManager {
             throw MCPError.invalidRequest("Resource not found: \(uri)")
         }
         
-        return try await client.readResource(uri: resourceUri)
+        do {
+            return try await client.readResource(uri: resourceUri)
+        } catch {
+            // Log the error for debugging
+            logger.error("Resource read failed for \(serverName): \(error)")
+            await delegate?.upstreamManagerDidLogMessage("Resource read failed for \(serverName): \(error.localizedDescription)", level: .error)
+            throw error
+        }
     }
     
     func getPrompt(name: String, arguments: [String: Any]?) async throws -> MCP.GetPrompt.Result {
@@ -317,26 +331,37 @@ actor UpstreamManager {
             throw MCPError.invalidRequest("Prompt not found: \(name)")
         }
         
-        // Use MCPArguments wrapper for thread-safe argument passing
-        let mcpArgs = MCPArguments(arguments)
-        let result = try await client.getPrompt(name: promptName, arguments: mcpArgs.toAnyDict())
-        return MCP.GetPrompt.Result(description: result.description, messages: result.messages)
+        do {
+            // Use MCPArguments wrapper for thread-safe argument passing
+            let mcpArgs = MCPArguments(arguments)
+            let result = try await client.getPrompt(name: promptName, arguments: mcpArgs.toAnyDict())
+            return MCP.GetPrompt.Result(description: result.description, messages: result.messages)
+        } catch {
+            // Log the error for debugging
+            logger.error("Prompt get failed for \(serverName): \(error)")
+            await delegate?.upstreamManagerDidLogMessage("Prompt get failed for \(serverName): \(error.localizedDescription)", level: .error)
+            throw error
+        }
     }
     
     // MARK: - Helper Methods
     
     private func parsePrefix(_ name: String) -> (serverName: String, itemName: String) {
-        let components = name.split(separator: ":", maxSplits: 1)
-        if components.count == 2 {
-            return (String(components[0]), String(components[1]))
+        let components = name.components(separatedBy: "___")
+        if components.count >= 2 {
+            let serverName = components[0]
+            let itemName = components.dropFirst().joined(separator: "___")
+            return (serverName, itemName)
         }
         return ("", name)
     }
     
     private func parseResourcePrefix(_ uri: String) -> (serverName: String, resourceUri: String) {
-        let components = uri.split(separator: ":", maxSplits: 1)
-        if components.count == 2 {
-            return (String(components[0]), String(components[1]))
+        let components = uri.components(separatedBy: "___")
+        if components.count >= 2 {
+            let serverName = components[0]
+            let resourceUri = components.dropFirst().joined(separator: "___")
+            return (serverName, resourceUri)
         }
         return ("", uri)
     }
